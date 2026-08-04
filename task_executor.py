@@ -18,6 +18,8 @@ _cost_basis_lock = threading.Lock()
 # the price API on every single alert.
 _sol_price_cache = {"price": None, "ts": 0}
 _sol_price_lock = threading.Lock()
+SOL_PRICE_CACHE_TTL_SECONDS = 300  # 5 min - CoinGecko's free tier is IP-rate-limited and
+# Render's free-tier IPs are shared across many apps, so a short TTL just means more 429s.
 
 
 def format_compact_number(value):
@@ -99,7 +101,7 @@ def get_sol_price_usd():
     """Current SOL/USD price via CoinGecko, cached for 60s. Returns None on failure."""
     now = time.time()
     with _sol_price_lock:
-        if _sol_price_cache["price"] is not None and now - _sol_price_cache["ts"] < 60:
+        if _sol_price_cache["price"] is not None and now - _sol_price_cache["ts"] < SOL_PRICE_CACHE_TTL_SECONDS:
             return _sol_price_cache["price"]
     try:
         resp = requests.get(
@@ -435,10 +437,15 @@ def execute_monitoring(wallet, helius_key, codex_api_key, alerts_config):
         last_processed_slots[wallet_address] = None
 
     while True:
-        base_url = f"https://api.helius.xyz/v0/addresses/{wallet_address}/transactions"
+        # NOTE: api.helius.xyz has been unreliable / is being phased out for this endpoint.
+        # Helius's current docs only list mainnet.helius-rpc.com as the server for
+        # GET /v0/addresses/{address}/transactions.
+        base_url = f"https://mainnet.helius-rpc.com/v0/addresses/{wallet_address}/transactions"
         params = {
             "api-key": helius_key,
-            "types": ["TRANSFER", "SWAP"],
+            # Current API takes singular "type" (requests serializes the list as
+            # repeated type=TRANSFER&type=SWAP). The old "types" param is not recognized.
+            "type": ["TRANSFER", "SWAP"],
             "limit": 5,
         }
 
@@ -456,7 +463,16 @@ def execute_monitoring(wallet, helius_key, codex_api_key, alerts_config):
 
             time.sleep(30)
         except requests.exceptions.RequestException as e:
-            click.echo(f"Error fetching transactions for {wallet_name} - {wallet_address}: {e}")
+            # Include the response body (if any) so a non-200 is actionable in logs
+            # instead of just "500 Server Error: Internal Server Error for url: ...".
+            body = ""
+            resp = getattr(e, "response", None)
+            if resp is not None:
+                try:
+                    body = f" | body: {resp.text[:300]}"
+                except Exception:
+                    pass
+            click.echo(f"Error fetching transactions for {wallet_name} - {wallet_address}: {e}{body}")
             time.sleep(60)
 
 

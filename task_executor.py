@@ -22,6 +22,21 @@ def format_market_cap(value):
     return f"{value:.2f}"
 
 
+def escape_markdown(text):
+    """
+    Escape Telegram legacy-Markdown special characters in untrusted text
+    (token names/tickers come from Codex and can contain '_', '*', '[', etc.,
+    which otherwise breaks Telegram's parser and causes the whole message
+    to be rejected with a 400 Bad Request).
+    """
+    if not text:
+        return text
+    text = str(text)
+    for ch in ("_", "*", "`", "[", "]"):
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
+
 CODEX_GRAPHQL_URL = "https://graph.codex.io/graphql"
 SOLANA_NETWORK_ID = 1399811149
 
@@ -98,9 +113,12 @@ def build_alert_message(action, wallet_name, token_info, amount, sol_amount, sig
     emoji = "\U0001F7E2" if action == "BOUGHT" else "\U0001F534"  # green/red circle
     sol_label = "SOL Spent" if action == "BOUGHT" else "SOL Received"
     cap = format_market_cap(token_info["market_cap"])
+    safe_wallet_name = escape_markdown(wallet_name)
+    safe_name = escape_markdown(token_info["name"])
+    safe_ticker = escape_markdown(token_info["ticker"])
     return (
-        f"{emoji} *{wallet_name}* {action}\n\n"
-        f"*Token:* {token_info['name']} (${token_info['ticker']})\n"
+        f"{emoji} *{safe_wallet_name}* {action}\n\n"
+        f"*Token:* {safe_name} (${safe_ticker})\n"
         f"*Market Cap:* ${cap}\n"
         f"*Amount:* {amount}\n"
         f"*{sol_label}:* {sol_amount} SOL\n"
@@ -121,9 +139,19 @@ def send_telegram_notification(bot_token, chat_id, message):
             "disable_web_page_preview": True,
         }
         response = requests.post(url, json=payload, timeout=10)
+        if not response.ok:
+            # Telegram puts the real reason (e.g. "can't parse entities") in the
+            # JSON body, not the status line, so log that instead of just the code.
+            try:
+                detail = response.json().get("description", response.text)
+            except ValueError:
+                detail = response.text
+            click.echo(f"Telegram API error {response.status_code}: {detail}")
         response.raise_for_status()
     except requests.RequestException as e:
-        click.echo(f"Error sending Telegram notification: {e}")
+        # Avoid ever logging the bot token, which requests.RequestException's
+        # str(e) includes as part of the request URL.
+        click.echo("Error sending Telegram notification (request failed)")
 
 
 def send_discord_notification(webhook_url, wallet_name, action, token_mint, token_amount, sol_amount, transaction_signature, coin_cap, coin_name, coin_ticker):
@@ -241,10 +269,10 @@ def process_transactions(wallet, transactions, codex_api_key, alerts_config, las
                     out_info = get_token_info(from_token["mint"], codex_api_key)
                     in_info = get_token_info(to_token["mint"], codex_api_key) if to_token else None
                     message = (
-                        f"\U0001F501 *{wallet_name}* SWAPPED\n\n"
-                        f"*Sold:* {from_token['tokenAmount']} {out_info['ticker']}\n"
+                        f"\U0001F501 *{escape_markdown(wallet_name)}* SWAPPED\n\n"
+                        f"*Sold:* {from_token['tokenAmount']} {escape_markdown(out_info['ticker'])}\n"
                         f"*Bought:* {to_token['tokenAmount'] if to_token else 'N/A'} "
-                        f"{in_info['ticker'] if in_info else 'N/A'}\n"
+                        f"{escape_markdown(in_info['ticker']) if in_info else 'N/A'}\n"
                         f"[View Transaction](https://solscan.io/tx/{transaction['signature']})"
                     )
                     telegram_bot_token = alerts_config.get("telegram_bot_token")

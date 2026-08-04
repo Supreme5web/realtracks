@@ -119,65 +119,6 @@ def get_sol_price_usd():
             return _sol_price_cache["price"]  # may still be None, or a stale-but-usable value
 
 
-def get_wallet_token_balance(wallet_address, token_mint, helius_api_key):
-    """
-    Current balance of `token_mint` held by `wallet_address`, via Helius's Wallet
-    Balances API (v1). Returns 0.0 if the wallet holds none (zero balances aren't
-    returned by default, so "not found" means zero), or None if the lookup itself
-    failed. Note: each call costs 100 Helius credits.
-    """
-    if not helius_api_key:
-        return None
-    try:
-        resp = requests.get(
-            f"https://api.helius.xyz/v1/wallet/{wallet_address}/balances",
-            params={"api-key": helius_api_key, "showNative": "false"},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        for token in data.get("balances", []):
-            if token.get("mint") == token_mint:
-                # `balance` is already decimal-adjusted (human-readable), no /10**decimals needed
-                return float(token.get("balance") or 0.0)
-        return 0.0
-    except Exception as e:
-        click.echo(f"Balance lookup failed for {wallet_address[:6]}...: {e}")
-        return None
-
-
-def estimate_supply(token_info):
-    """Approximate circulating supply as marketCap / priceUSD (consistent with the MC already shown)."""
-    try:
-        price = float(token_info.get("price_usd") or 0)
-        mc = float(token_info.get("market_cap") or 0)
-    except (TypeError, ValueError):
-        return None
-    if price <= 0:
-        return None
-    return mc / price
-
-
-def compute_holdings_pct(balance, supply):
-    if balance is None or not supply:
-        return None
-    try:
-        return (balance / supply) * 100
-    except ZeroDivisionError:
-        return None
-
-
-def compute_pct_sold(units_sold, post_balance):
-    """% of pre-sale holdings that this sell represents, derived from the current
-    (post-sale) on-chain balance, so we don't need a separate balance snapshot."""
-    if post_balance is None:
-        return None
-    pre_balance = post_balance + units_sold
-    if pre_balance <= 0:
-        return None
-    return (units_sold / pre_balance) * 100
-
-
 def record_buy(wallet_address, token_mint, units, cost_usd):
     """Add to the weighted-average cost basis for this wallet/token."""
     if units <= 0 or cost_usd is None:
@@ -217,6 +158,32 @@ def record_sell(wallet_address, token_mint, units_sold, proceeds_usd):
     realized_pnl = proceeds_usd - cost_basis_sold
     pnl_pct = (realized_pnl / cost_basis_sold) * 100
     return realized_pnl, pnl_pct
+
+
+# Trading bots to link out to on each alert, with your referral codes baked
+# into the URL. Rendered as inline buttons (3 per row) under each Telegram
+# buy/sell alert, keyed off the token's contract address (CA).
+TRADING_BOTS = [
+    {"label": "AXI", "build_url": lambda ca: f"https://axiom.trade/t/{ca}/@supremee5?chain=sol"},
+    {"label": "TRO", "build_url": lambda ca: f"https://t.me/menelaus_trojanbot?start=d-supremeesol-{ca}"},
+    {"label": "BONK", "build_url": lambda ca: f"https://t.me/bonkbot_bot?start=ref_ggydi_ca_{ca}"},
+    {"label": "MAE", "build_url": lambda ca: f"https://t.me/maestro?start={ca}-hollydodson"},
+    {"label": "GMGN", "build_url": lambda ca: f"https://gmgn.ai/sol/token/supremee5_{ca}"},
+    {"label": "COVE", "build_url": lambda ca: f"https://t.me/cove_trading_bot?start=ref_supremeesol-{ca}"},
+]
+
+
+def build_trading_bot_keyboard(token_mint):
+    """Telegram inline keyboard of quick-trade buttons (your referral links) for a token, 3 per row."""
+    buttons = [{"text": bot["label"], "url": bot["build_url"](token_mint)} for bot in TRADING_BOTS]
+    rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+    return {"inline_keyboard": rows}
+
+
+def build_trading_bot_links_text(token_mint):
+    """Plain markdown links for the same trading bots, for use in Discord embeds
+    (incoming webhooks can't reliably render interactive buttons like Telegram can)."""
+    return " | ".join(f"[{bot['label']}]({bot['build_url'](token_mint)})" for bot in TRADING_BOTS)
 
 
 # Mints that show up as intermediate routing hops in multi-hop swaps (e.g. a
@@ -302,53 +269,45 @@ def get_token_info(token_mint, codex_api_key):
 
 
 def build_buy_message(wallet_name, wallet_address, token_info, token_amount, sol_amount,
-                       usd_value, token_mint, holdings, holdings_pct):
+                       usd_value, token_mint):
     safe_wallet_name = escape_markdown(wallet_name)
     safe_ticker = escape_markdown(token_info["ticker"])
     cap = format_compact_number(token_info["market_cap"])
     token_link = f"https://solscan.io/token/{token_mint}"
-    holds_str = format_compact_number(holdings) if holdings is not None else "N/A"
-    holds_pct_str = f"{holdings_pct:.2f}%" if holdings_pct is not None else "N/A"
 
     return (
         f"\U0001F7E2 *BUY ALERT*\n\n"
         f"*{safe_wallet_name}* swapped {format_sol(sol_amount)} SOL \u2192 "
         f"{format_amount(token_amount)} ({format_usd(usd_value)}) "
         f"[#{safe_ticker}]({token_link}) at {cap} MC\n\n"
-        f"Holds: {holds_str} ({holds_pct_str})\n"
         f"CA: `{token_mint}`\n"
         f"Wallet: `{wallet_address}`"
     )
 
 
 def build_sell_message(wallet_name, wallet_address, token_info, token_amount, sol_amount,
-                        usd_value, token_mint, holdings, holdings_pct, pct_sold,
-                        pnl_usd, pnl_pct):
+                        usd_value, token_mint, pnl_usd, pnl_pct):
     safe_wallet_name = escape_markdown(wallet_name)
     safe_ticker = escape_markdown(token_info["ticker"])
     cap = format_compact_number(token_info["market_cap"])
     token_link = f"https://solscan.io/token/{token_mint}"
-    holds_str = format_compact_number(holdings) if holdings is not None else "N/A"
-    holds_pct_str = f"{holdings_pct:.2f}%" if holdings_pct is not None else "N/A"
-    pct_sold_str = f"{pct_sold:.0f}% sold" if pct_sold is not None else "sold"
 
     lines = [
         f"\U0001F534 *SELL ALERT*",
         "",
         f"*{safe_wallet_name}* swapped {format_amount(token_amount)} ({format_usd(usd_value)}) "
-        f"[#{safe_ticker}]({token_link}) \u2192 {format_sol(sol_amount)} SOL ({pct_sold_str}) at {cap} MC",
+        f"[#{safe_ticker}]({token_link}) \u2192 {format_sol(sol_amount)} SOL at {cap} MC",
         "",
     ]
     if pnl_usd is not None and pnl_pct is not None:
         lines.append(f"PnL: {format_usd(pnl_usd, signed=True)} ({format_signed_pct(pnl_pct)})")
-    lines.append(f"Holds: {holds_str} ({holds_pct_str})")
     lines.append(f"CA: `{token_mint}`")
     lines.append(f"Wallet: `{wallet_address}`")
     return "\n".join(lines)
 
 
-def send_telegram_notification(bot_token, chat_id, message):
-    """Send a message to a Telegram chat via the Bot API."""
+def send_telegram_notification(bot_token, chat_id, message, reply_markup=None):
+    """Send a message to a Telegram chat via the Bot API, optionally with an inline keyboard."""
     if not bot_token or not chat_id:
         return
     try:
@@ -359,6 +318,8 @@ def send_telegram_notification(bot_token, chat_id, message):
             "parse_mode": "Markdown",
             "disable_web_page_preview": True,
         }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
         response = requests.post(url, json=payload, timeout=10)
         if not response.ok:
             # Telegram puts the real reason (e.g. "can't parse entities") in the
@@ -377,8 +338,7 @@ def send_telegram_notification(bot_token, chat_id, message):
 
 def send_discord_notification(webhook_url, wallet_name, wallet_address, action, token_mint,
                                token_amount, sol_amount, usd_value, coin_cap, coin_name,
-                               coin_ticker, holdings, holdings_pct, pct_sold=None,
-                               pnl_usd=None, pnl_pct=None):
+                               coin_ticker, pnl_usd=None, pnl_pct=None):
     """Send a Discord notification with a formatted embed. (Optional, only used if a Discord webhook is configured.)"""
     if not webhook_url:
         return
@@ -388,18 +348,13 @@ def send_discord_notification(webhook_url, wallet_name, wallet_address, action, 
             {"name": "**Token**", "value": f'${coin_ticker} - {coin_name}', "inline": True},
             {"name": "**Market Cap**", "value": f'${format_compact_number(coin_cap)}', "inline": False},
             {"name": "**Amount**", "value": f"{format_amount(token_amount)} ({format_usd(usd_value)})", "inline": False},
-            {"name": "**SOL**", "value": f"{format_sol(sol_amount)} SOL" + (f" ({pct_sold:.0f}% sold)" if pct_sold is not None else ""), "inline": False},
+            {"name": "**SOL**", "value": f"{format_sol(sol_amount)} SOL", "inline": False},
         ]
         if pnl_usd is not None and pnl_pct is not None:
             fields.append({"name": "**PnL**", "value": f"{format_usd(pnl_usd, signed=True)} ({format_signed_pct(pnl_pct)})", "inline": False})
-        fields.append({
-            "name": "**Holds**",
-            "value": f"{format_compact_number(holdings) if holdings is not None else 'N/A'} "
-                     f"({holdings_pct:.2f}%)" if holdings_pct is not None else "N/A",
-            "inline": False,
-        })
         fields.append({"name": "**Token Mint**", "value": token_mint, "inline": False})
         fields.append({"name": "**Wallet**", "value": wallet_address, "inline": False})
+        fields.append({"name": "**Trade**", "value": build_trading_bot_links_text(token_mint), "inline": False})
 
         embed = {
             "embeds": [
@@ -419,7 +374,7 @@ def send_discord_notification(webhook_url, wallet_name, wallet_address, action, 
 
 
 def notify(alerts_config, action, wallet_name, wallet_address, token_info, token_mint,
-           token_amount, sol_amount, helius_api_key):
+           token_amount, sol_amount):
     """
     Compute USD value / holdings % / PnL for a buy or sell, update the cost-basis
     tracker, and fan the alert out to whichever channels are configured.
@@ -441,11 +396,6 @@ def notify(alerts_config, action, wallet_name, wallet_address, token_info, token
     # since it reflects the real trade rather than a possibly-stale token price snapshot.
     sol_usd_value = (sol_amount * sol_price) if sol_price is not None else None
 
-    balance = get_wallet_token_balance(wallet_address, token_mint, helius_api_key)
-    supply = estimate_supply(token_info)
-    holdings_pct = compute_holdings_pct(balance, supply)
-
-    pct_sold = None
     pnl_usd = None
     pnl_pct = None
 
@@ -453,27 +403,27 @@ def notify(alerts_config, action, wallet_name, wallet_address, token_info, token
         if sol_usd_value is not None:
             record_buy(wallet_address, token_mint, token_amount, sol_usd_value)
     elif action == "SOLD":
-        pct_sold = compute_pct_sold(token_amount, balance)
         pnl_usd, pnl_pct = record_sell(wallet_address, token_mint, token_amount, sol_usd_value)
 
     if telegram_bot_token and telegram_chat_id:
         if action == "BOUGHT":
             message = build_buy_message(
                 wallet_name, wallet_address, token_info, token_amount, sol_amount,
-                usd_value, token_mint, balance, holdings_pct,
+                usd_value, token_mint,
             )
         else:
             message = build_sell_message(
                 wallet_name, wallet_address, token_info, token_amount, sol_amount,
-                usd_value, token_mint, balance, holdings_pct, pct_sold, pnl_usd, pnl_pct,
+                usd_value, token_mint, pnl_usd, pnl_pct,
             )
-        send_telegram_notification(telegram_bot_token, telegram_chat_id, message)
+        keyboard = build_trading_bot_keyboard(token_mint)
+        send_telegram_notification(telegram_bot_token, telegram_chat_id, message, reply_markup=keyboard)
 
     if discord_webhook:
         send_discord_notification(
             discord_webhook, wallet_name, wallet_address, action, token_mint,
             token_amount, sol_amount, usd_value, token_info["market_cap"], token_info["name"],
-            token_info["ticker"], balance, holdings_pct, pct_sold, pnl_usd, pnl_pct,
+            token_info["ticker"], pnl_usd, pnl_pct,
         )
 
 
@@ -499,7 +449,7 @@ def execute_monitoring(wallet, helius_key, codex_api_key, alerts_config):
 
             if transactions:
                 last_processed_slots[wallet_address] = process_transactions(
-                    wallet, transactions, codex_api_key, alerts_config, last_processed_slots[wallet_address], helius_key
+                    wallet, transactions, codex_api_key, alerts_config, last_processed_slots[wallet_address]
                 )
             else:
                 click.echo(f"No new transactions for {wallet_name} ({wallet_address}).")
@@ -510,7 +460,7 @@ def execute_monitoring(wallet, helius_key, codex_api_key, alerts_config):
             time.sleep(60)
 
 
-def process_transactions(wallet, transactions, codex_api_key, alerts_config, last_processed_slot, helius_api_key):
+def process_transactions(wallet, transactions, codex_api_key, alerts_config, last_processed_slot):
     wallet_address = wallet["address"]
     wallet_name = wallet["name"]
     transactions = sorted(transactions, key=lambda x: x["slot"])
@@ -556,10 +506,10 @@ def process_transactions(wallet, transactions, codex_api_key, alerts_config, las
                 token_info = get_token_info(token_mint, codex_api_key)
                 if leg.get("fromUserAccount") == wallet_address:
                     notify(alerts_config, "SOLD", wallet_name, wallet_address, token_info,
-                           token_mint, amount, sol_amount, helius_api_key)
+                           token_mint, amount, sol_amount)
                 elif leg.get("toUserAccount") == wallet_address:
                     notify(alerts_config, "BOUGHT", wallet_name, wallet_address, token_info,
-                           token_mint, amount, sol_amount, helius_api_key)
+                           token_mint, amount, sol_amount)
                 continue
 
             # Two (or more) SPL-token legs: a direct token-to-token swap with
@@ -589,7 +539,9 @@ def process_transactions(wallet, transactions, codex_api_key, alerts_config, las
             telegram_bot_token = alerts_config.get("telegram_bot_token")
             telegram_chat_id = alerts_config.get("telegram_chat_id")
             if telegram_bot_token and telegram_chat_id:
-                send_telegram_notification(telegram_bot_token, telegram_chat_id, message)
+                # Buttons trade the newly-acquired token, since that's the position going forward.
+                keyboard = build_trading_bot_keyboard(to_token["mint"])
+                send_telegram_notification(telegram_bot_token, telegram_chat_id, message, reply_markup=keyboard)
 
         # Process TRANSFER transactions (simple buy/sell)
         elif transaction["type"] == "TRANSFER":
@@ -603,12 +555,12 @@ def process_transactions(wallet, transactions, codex_api_key, alerts_config, las
                 if token_transfer.get("toUserAccount") == wallet_address:
                     token_info = get_token_info(token_mint, codex_api_key)
                     notify(alerts_config, "BOUGHT", wallet_name, wallet_address, token_info,
-                           token_mint, amount, sol_amount, helius_api_key)
+                           token_mint, amount, sol_amount)
 
                 elif token_transfer.get("fromUserAccount") == wallet_address:
                     token_info = get_token_info(token_mint, codex_api_key)
                     notify(alerts_config, "SOLD", wallet_name, wallet_address, token_info,
-                           token_mint, amount, sol_amount, helius_api_key)
+                           token_mint, amount, sol_amount)
 
     return latest_slot
 

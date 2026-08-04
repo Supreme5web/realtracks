@@ -120,22 +120,26 @@ def get_sol_price_usd():
 
 
 def get_wallet_token_balance(wallet_address, token_mint, helius_api_key):
-    """Current balance of `token_mint` held by `wallet_address`, via Helius. Returns None on failure."""
+    """
+    Current balance of `token_mint` held by `wallet_address`, via Helius's Wallet
+    Balances API (v1). Returns 0.0 if the wallet holds none (zero balances aren't
+    returned by default, so "not found" means zero), or None if the lookup itself
+    failed. Note: each call costs 100 Helius credits.
+    """
     if not helius_api_key:
         return None
     try:
         resp = requests.get(
-            f"https://api.helius.xyz/v0/addresses/{wallet_address}/balances",
-            params={"api-key": helius_api_key},
+            f"https://api.helius.xyz/v1/wallet/{wallet_address}/balances",
+            params={"api-key": helius_api_key, "showNative": "false"},
             timeout=10,
         )
         resp.raise_for_status()
         data = resp.json()
-        for token in data.get("tokens", []):
+        for token in data.get("balances", []):
             if token.get("mint") == token_mint:
-                amount = token.get("amount", 0)
-                decimals = token.get("decimals", 0)
-                return amount / (10 ** decimals) if decimals else float(amount)
+                # `balance` is already decimal-adjusted (human-readable), no /10**decimals needed
+                return float(token.get("balance") or 0.0)
         return 0.0
     except Exception as e:
         click.echo(f"Balance lookup failed for {wallet_address[:6]}...: {e}")
@@ -214,6 +218,15 @@ def record_sell(wallet_address, token_mint, units_sold, proceeds_usd):
     pnl_pct = (realized_pnl / cost_basis_sold) * 100
     return realized_pnl, pnl_pct
 
+
+# Mints that show up as intermediate routing hops in multi-hop swaps (e.g. a
+# Jupiter route that goes Token -> USDC -> Token) rather than as a token the
+# person actually chose to buy or sell. We never alert on these directly.
+IGNORED_MINTS = {
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+    "So11111111111111111111111111111111111111112",  # Wrapped SOL
+}
 
 CODEX_GRAPHQL_URL = "https://graph.codex.io/graphql"
 SOLANA_NETWORK_ID = 1399811149
@@ -524,30 +537,68 @@ def process_transactions(wallet, transactions, codex_api_key, alerts_config, las
         # Process SWAP transactions (wallet trades one token for another directly)
         if transaction["type"] == "SWAP":
             token_transfers = transaction.get("tokenTransfers", [])
-            if len(token_transfers) >= 1:
-                from_token = token_transfers[0]
-                to_token = token_transfers[1] if len(token_transfers) > 1 else None
+            if not token_transfers:
+                continue
 
-                if from_token.get("fromUserAccount") == wallet_address:
-                    out_info = get_token_info(from_token["mint"], codex_api_key)
-                    in_info = get_token_info(to_token["mint"], codex_api_key) if to_token else None
-                    message = (
-                        f"\U0001F501 *{escape_markdown(wallet_name)}* SWAPPED\n\n"
-                        f"*Sold:* {from_token['tokenAmount']} {escape_markdown(out_info['ticker'])}\n"
-                        f"*Bought:* {to_token['tokenAmount'] if to_token else 'N/A'} "
-                        f"{escape_markdown(in_info['ticker']) if in_info else 'N/A'}\n"
-                        f"[View Transaction](https://solscan.io/tx/{transaction['signature']})"
-                    )
-                    telegram_bot_token = alerts_config.get("telegram_bot_token")
-                    telegram_chat_id = alerts_config.get("telegram_chat_id")
-                    if telegram_bot_token and telegram_chat_id:
-                        send_telegram_notification(telegram_bot_token, telegram_chat_id, message)
+            if len(token_transfers) == 1:
+                # A single SPL-token leg means the other side of the swap was
+                # native SOL (SOL isn't an SPL token transfer - it shows up as
+                # the nativeBalanceChange we already captured as sol_amount).
+                # This is what Helius reports for most aggregator-routed
+                # (e.g. Jupiter) buys/sells against SOL.
+                leg = token_transfers[0]
+                token_mint = leg["mint"]
+                amount = leg["tokenAmount"]
+
+                if token_mint in IGNORED_MINTS or amount <= 0 or not sol_amount:
+                    continue
+
+                token_info = get_token_info(token_mint, codex_api_key)
+                if leg.get("fromUserAccount") == wallet_address:
+                    notify(alerts_config, "SOLD", wallet_name, wallet_address, token_info,
+                           token_mint, amount, sol_amount, helius_api_key)
+                elif leg.get("toUserAccount") == wallet_address:
+                    notify(alerts_config, "BOUGHT", wallet_name, wallet_address, token_info,
+                           token_mint, amount, sol_amount, helius_api_key)
+                continue
+
+            # Two (or more) SPL-token legs: a direct token-to-token swap with
+            # no SOL involved. Resolve the actual outgoing/incoming legs for
+            # this wallet rather than assuming index 0/1, skip it entirely if
+            # either leg is a routing-hop stablecoin, and skip posting anything
+            # if we can't cleanly resolve both sides (rather than post a
+            # message with "N/A" in it).
+            from_token = next((t for t in token_transfers if t.get("fromUserAccount") == wallet_address), None)
+            to_token = next((t for t in token_transfers if t.get("toUserAccount") == wallet_address), None)
+
+            if not from_token or not to_token:
+                continue
+            if from_token["mint"] in IGNORED_MINTS or to_token["mint"] in IGNORED_MINTS:
+                continue
+
+            out_info = get_token_info(from_token["mint"], codex_api_key)
+            in_info = get_token_info(to_token["mint"], codex_api_key)
+            message = (
+                f"\U0001F501 *{escape_markdown(wallet_name)}* SWAPPED\n\n"
+                f"*Sold:* {format_amount(from_token['tokenAmount'])} {escape_markdown(out_info['ticker'])}\n"
+                f"*Bought:* {format_amount(to_token['tokenAmount'])} {escape_markdown(in_info['ticker'])}\n"
+                f"CA (sold): `{from_token['mint']}`\n"
+                f"CA (bought): `{to_token['mint']}`\n"
+                f"Wallet: `{wallet_address}`"
+            )
+            telegram_bot_token = alerts_config.get("telegram_bot_token")
+            telegram_chat_id = alerts_config.get("telegram_chat_id")
+            if telegram_bot_token and telegram_chat_id:
+                send_telegram_notification(telegram_bot_token, telegram_chat_id, message)
 
         # Process TRANSFER transactions (simple buy/sell)
         elif transaction["type"] == "TRANSFER":
             for token_transfer in transaction.get("tokenTransfers", []):
                 token_mint = token_transfer["mint"]
                 amount = token_transfer["tokenAmount"]
+
+                if token_mint in IGNORED_MINTS or amount <= 0:
+                    continue
 
                 if token_transfer.get("toUserAccount") == wallet_address:
                     token_info = get_token_info(token_mint, codex_api_key)

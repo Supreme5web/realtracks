@@ -605,7 +605,12 @@ def run_tasks_concurrently(wallets, helius_api_key, codex_api_key, alerts_config
         time.sleep(2)
         execute_monitoring(wallet, helius_api_key, codex_api_key, alerts_config)
 
-    with ThreadPoolExecutor(max_workers=min(len(wallets), 5) or 1) as executor:
+    # Each wallet's monitoring loop runs forever (it's a `while True`), so it holds
+    # its worker thread for the lifetime of the process rather than returning it to
+    # the pool. A fixed cap here (e.g. 5) silently starves any wallets beyond that
+    # count - they'd sit queued forever waiting for a thread that never frees up.
+    # The pool size must scale with the wallet count, not be capped.
+    with ThreadPoolExecutor(max_workers=len(wallets) or 1) as executor:
         futures = [executor.submit(execute_with_delay, wallet) for wallet in wallets]
         for future in as_completed(futures):
             try:

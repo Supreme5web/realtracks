@@ -376,13 +376,13 @@ def send_discord_notification(webhook_url, wallet_name, wallet_address, action, 
 
 
 def notify(alerts_config, action, wallet_name, wallet_address, token_info, token_mint,
-           token_amount, sol_amount):
+           token_amount, sol_amount, signature=None):
     """
     Compute USD value / holdings % / PnL for a buy or sell, update the cost-basis
     tracker, and fan the alert out to whichever channels are configured.
     """
     telegram_bot_token = alerts_config.get("telegram_bot_token")
-    telegram_chat_id = alerts_config.get("telegram_chat_id")
+    telegram_chat_ids = alerts_config.get("telegram_chat_ids") or []
     discord_webhook = alerts_config.get("discord_webhook")
 
     sol_price = get_sol_price_usd()
@@ -398,6 +398,21 @@ def notify(alerts_config, action, wallet_name, wallet_address, token_info, token
     # since it reflects the real trade rather than a possibly-stale token price snapshot.
     sol_usd_value = (sol_amount * sol_price) if sol_price is not None else None
 
+    # Sanity check: the token-price-derived USD value and the SOL-leg-derived USD value
+    # should roughly agree. When they don't, something is off (an off-chain price feed
+    # that's stale/wrong for a low-liquidity token, a bundled/multi-hop tx whose net SOL
+    # balance change doesn't equal the swap's gross value, etc.) - log it with the
+    # signature so a specific mismatched trade can actually be looked up on Solscan later,
+    # rather than only ever surfacing as an unexplained-looking number in the alert.
+    if usd_value and sol_usd_value and min(usd_value, sol_usd_value) > 0:
+        ratio = max(usd_value, sol_usd_value) / min(usd_value, sol_usd_value)
+        if ratio >= 3:
+            sig_note = f" sig={signature}" if signature else ""
+            click.echo(
+                f"[SolTracker] USD/SOL value mismatch for {wallet_name} ({token_mint}): "
+                f"token-price ${usd_value:,.2f} vs sol-leg ${sol_usd_value:,.2f}{sig_note}"
+            )
+
     pnl_usd = None
     pnl_pct = None
 
@@ -407,7 +422,7 @@ def notify(alerts_config, action, wallet_name, wallet_address, token_info, token
     elif action == "SOLD":
         pnl_usd, pnl_pct = record_sell(wallet_address, token_mint, token_amount, sol_usd_value)
 
-    if telegram_bot_token and telegram_chat_id:
+    if telegram_bot_token and telegram_chat_ids:
         if action == "BOUGHT":
             message = build_buy_message(
                 wallet_name, wallet_address, token_info, token_amount, sol_amount,
@@ -419,7 +434,8 @@ def notify(alerts_config, action, wallet_name, wallet_address, token_info, token
                 usd_value, token_mint, pnl_usd, pnl_pct,
             )
         keyboard = build_trading_bot_keyboard(token_mint)
-        send_telegram_notification(telegram_bot_token, telegram_chat_id, message, reply_markup=keyboard)
+        for chat_id in telegram_chat_ids:
+            send_telegram_notification(telegram_bot_token, chat_id, message, reply_markup=keyboard)
 
     if discord_webhook:
         send_discord_notification(
@@ -522,10 +538,10 @@ def process_transactions(wallet, transactions, codex_api_key, alerts_config, las
                 token_info = get_token_info(token_mint, codex_api_key)
                 if leg.get("fromUserAccount") == wallet_address:
                     notify(alerts_config, "SOLD", wallet_name, wallet_address, token_info,
-                           token_mint, amount, sol_amount)
+                           token_mint, amount, sol_amount, signature=transaction.get("signature"))
                 elif leg.get("toUserAccount") == wallet_address:
                     notify(alerts_config, "BOUGHT", wallet_name, wallet_address, token_info,
-                           token_mint, amount, sol_amount)
+                           token_mint, amount, sol_amount, signature=transaction.get("signature"))
                 continue
 
             # Two (or more) SPL-token legs: a direct token-to-token swap with
@@ -553,11 +569,12 @@ def process_transactions(wallet, transactions, codex_api_key, alerts_config, las
                 f"Wallet: `{wallet_address}`"
             )
             telegram_bot_token = alerts_config.get("telegram_bot_token")
-            telegram_chat_id = alerts_config.get("telegram_chat_id")
-            if telegram_bot_token and telegram_chat_id:
+            telegram_chat_ids = alerts_config.get("telegram_chat_ids") or []
+            if telegram_bot_token and telegram_chat_ids:
                 # Buttons trade the newly-acquired token, since that's the position going forward.
                 keyboard = build_trading_bot_keyboard(to_token["mint"])
-                send_telegram_notification(telegram_bot_token, telegram_chat_id, message, reply_markup=keyboard)
+                for chat_id in telegram_chat_ids:
+                    send_telegram_notification(telegram_bot_token, chat_id, message, reply_markup=keyboard)
 
         # Process TRANSFER transactions (simple buy/sell)
         elif transaction["type"] == "TRANSFER":
@@ -571,12 +588,12 @@ def process_transactions(wallet, transactions, codex_api_key, alerts_config, las
                 if token_transfer.get("toUserAccount") == wallet_address:
                     token_info = get_token_info(token_mint, codex_api_key)
                     notify(alerts_config, "BOUGHT", wallet_name, wallet_address, token_info,
-                           token_mint, amount, sol_amount)
+                           token_mint, amount, sol_amount, signature=transaction.get("signature"))
 
                 elif token_transfer.get("fromUserAccount") == wallet_address:
                     token_info = get_token_info(token_mint, codex_api_key)
                     notify(alerts_config, "SOLD", wallet_name, wallet_address, token_info,
-                           token_mint, amount, sol_amount)
+                           token_mint, amount, sol_amount, signature=transaction.get("signature"))
 
     return latest_slot
 

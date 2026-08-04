@@ -48,10 +48,15 @@ def start_tracking_background():
 
         alerts_config = {
             "telegram_bot_token": os.environ.get("TELEGRAM_BOT_TOKEN"),
-            "telegram_chat_id": os.environ.get("TELEGRAM_CHAT_ID"),
+            # Supports one or more destinations, comma-separated, e.g.
+            # "123456789,@mychannel" to alert both your own DM with the bot
+            # and a channel. Whitespace around each entry is stripped.
+            "telegram_chat_ids": [
+                c.strip() for c in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if c.strip()
+            ],
             "discord_webhook": os.environ.get("DISCORD_WEBHOOK"),
         }
-        has_telegram = alerts_config["telegram_bot_token"] and alerts_config["telegram_chat_id"]
+        has_telegram = alerts_config["telegram_bot_token"] and alerts_config["telegram_chat_ids"]
         has_discord = alerts_config["discord_webhook"]
         if not has_telegram and not has_discord:
             raise ValueError(

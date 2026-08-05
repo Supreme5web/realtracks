@@ -524,17 +524,31 @@ def execute_monitoring(wallet, quicknode_url, codex_api_key, alerts_config):
                 # getSignaturesForAddress returns newest-first; process oldest-to-newest
                 # so alerts come out in chronological order.
                 sig_infos = list(reversed(sig_infos))
+                click.echo(
+                    f"[SolTracker] {wallet_name} ({wallet_address}): found {len(sig_infos)} "
+                    f"new signature(s) this poll"
+                )
                 for info in sig_infos:
                     if info.get("err") is not None:
                         continue  # skip failed transactions
 
-                    tx_result = rpc_call(
-                        quicknode_url,
-                        "getTransaction",
-                        [info["signature"], {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
-                    )
-                    if tx_result:
-                        process_transaction(wallet, tx_result, info["signature"], codex_api_key, alerts_config)
+                    try:
+                        tx_result = rpc_call(
+                            quicknode_url,
+                            "getTransaction",
+                            [info["signature"], {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
+                        )
+                        if tx_result:
+                            process_transaction(wallet, tx_result, info["signature"], codex_api_key, alerts_config)
+                    except Exception as e:
+                        # Don't let one bad/unparseable transaction abort the rest of the
+                        # batch - log it and move on. (last_processed_signatures still
+                        # advances below either way, so this signature won't be retried
+                        # forever and block newer trades from ever being seen.)
+                        click.echo(
+                            f"[SolTracker] {wallet_name} - {info.get('signature')}: "
+                            f"failed to process: {e}"
+                        )
 
                 last_processed_signatures[wallet_address] = sig_infos[-1]["signature"]
             else:
@@ -604,6 +618,12 @@ def process_transaction(wallet, tx_result, signature, codex_api_key, alerts_conf
         return  # failed transaction, nothing actually settled
 
     wallet_index = _account_index(tx_result, wallet_address)
+    if wallet_index is None:
+        click.echo(
+            f"[SolTracker] {wallet_name} - {signature}: skipped, wallet not found in "
+            f"this tx's accountKeys (likely not the signer/fee-payer)"
+        )
+        return
 
     # Native SOL leg: the wallet's own lamport balance before vs after. Note this
     # includes the network/priority fee if the wallet is also the fee payer.
@@ -619,6 +639,10 @@ def process_transaction(wallet, tx_result, signature, codex_api_key, alerts_conf
     wsol_delta = mint_deltas.get(WSOL_MINT, 0.0)
     sol_amount = round(max(abs(native_delta), abs(wsol_delta)), 4)
     if not sol_amount:
+        click.echo(
+            f"[SolTracker] {wallet_name} - {signature}: skipped, no net SOL/WSOL "
+            f"balance change detected (native_delta={native_delta}, wsol_delta={wsol_delta})"
+        )
         return
 
     # The traded token is whichever non-SOL/non-stable mint actually moved for
@@ -630,6 +654,11 @@ def process_transaction(wallet, tx_result, signature, codex_api_key, alerts_conf
         if mint not in IGNORED_MINTS and abs(delta) > 1e-9
     ]
     if len(candidates) != 1:
+        click.echo(
+            f"[SolTracker] {wallet_name} - {signature}: skipped, expected exactly 1 "
+            f"non-ignored token mint to move but found {len(candidates)} "
+            f"({[m for m, _ in candidates]})"
+        )
         return
     token_mint, token_delta = candidates[0]
 
@@ -637,9 +666,11 @@ def process_transaction(wallet, tx_result, signature, codex_api_key, alerts_conf
     token_info = get_token_info(token_mint, codex_api_key)
 
     if token_delta > 0:
+        click.echo(f"[SolTracker] {wallet_name} - {signature}: detected BUY, sending alert")
         notify(alerts_config, "BOUGHT", wallet_name, wallet_address, token_info,
                token_mint, token_amount, sol_amount, codex_api_key, signature=signature)
     elif token_delta < 0:
+        click.echo(f"[SolTracker] {wallet_name} - {signature}: detected SELL, sending alert")
         notify(alerts_config, "SOLD", wallet_name, wallet_address, token_info,
                token_mint, token_amount, sol_amount, codex_api_key, signature=signature)
 

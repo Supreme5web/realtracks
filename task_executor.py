@@ -100,11 +100,19 @@ def escape_markdown(text):
 
 
 def get_sol_price_usd():
-    """Current SOL/USD price via CoinGecko, cached for 60s. Returns None on failure."""
+    """
+    Current SOL/USD price, cached for SOL_PRICE_CACHE_TTL_SECONDS. Tries CoinGecko
+    first, then falls back to Binance's public ticker if CoinGecko is rate-limited
+    or otherwise unavailable - Binance's public market-data endpoints don't require
+    an API key and have a much higher rate limit than CoinGecko's free tier, which
+    is shared across every app hitting it from Render's free-tier IP pool.
+    Returns None only if both sources fail and there's no usable cached price.
+    """
     now = time.time()
     with _sol_price_lock:
         if _sol_price_cache["price"] is not None and now - _sol_price_cache["ts"] < SOL_PRICE_CACHE_TTL_SECONDS:
             return _sol_price_cache["price"]
+
     try:
         resp = requests.get(
             "https://api.coingecko.com/api/v3/simple/price",
@@ -118,9 +126,25 @@ def get_sol_price_usd():
             _sol_price_cache["ts"] = now
         return price
     except Exception as e:
-        click.echo(f"SOL price lookup failed: {e}")
+        click.echo(f"SOL price lookup failed (CoinGecko): {e}")
+
+    try:
+        resp = requests.get(
+            "https://api.binance.com/api/v3/ticker/price",
+            params={"symbol": "SOLUSDT"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        price = float(resp.json()["price"])
         with _sol_price_lock:
-            return _sol_price_cache["price"]  # may still be None, or a stale-but-usable value
+            _sol_price_cache["price"] = price
+            _sol_price_cache["ts"] = now
+        return price
+    except Exception as e:
+        click.echo(f"SOL price lookup failed (Binance fallback): {e}")
+
+    with _sol_price_lock:
+        return _sol_price_cache["price"]  # may still be None, or a stale-but-usable value
 
 
 def record_buy(wallet_address, token_mint, units, cost_usd):
@@ -308,9 +332,11 @@ def build_buy_message(wallet_name, wallet_address, token_info, token_amount, sol
 
     return (
         f"\U0001F7E2 *BUY*\n"
+        f"\n"
         f"*{safe_wallet_name}* bought {amount} *{safe_ticker}*\n"
         f"*Spent:* {format_sol(sol_amount)} SOL ({format_usd(usd_value)})\n"
         f"*Entry:* {cap} *MC*\n"
+        f"\n"
         f"*CA:* `{token_mint}`\n"
         f"*Wallet:* `{wallet_address}`"
     )
@@ -325,12 +351,14 @@ def build_sell_message(wallet_name, wallet_address, token_info, token_amount, so
 
     lines = [
         f"\U0001F534 *SELL*",
+        "",
         f"*{safe_wallet_name}* sold {amount} *{safe_ticker}*",
         f"*Received:* {format_sol(sol_amount)} SOL ({format_usd(usd_value)})",
     ]
     if pnl_usd is not None and pnl_pct is not None:
         lines.append(f"\U0001F4C8 PnL: {format_usd(pnl_usd, signed=True)} ({format_signed_pct(pnl_pct)})")
     lines.append(f"*MC:* {cap}")
+    lines.append("")
     lines.append(f"*CA:* `{token_mint}`")
     lines.append(f"*Wallet:* `{wallet_address}`")
     return "\n".join(lines)
@@ -454,12 +482,12 @@ def notify(alerts_config, action, wallet_name, wallet_address, token_info, token
         if action == "BOUGHT":
             message = build_buy_message(
                 wallet_name, wallet_address, token_info, token_amount, sol_amount,
-                usd_value, token_mint,
+                sol_usd_value, token_mint,
             )
         else:
             message = build_sell_message(
                 wallet_name, wallet_address, token_info, token_amount, sol_amount,
-                usd_value, token_mint, pnl_usd, pnl_pct,
+                sol_usd_value, token_mint, pnl_usd, pnl_pct,
             )
         keyboard = build_trading_bot_keyboard(token_mint)
         for chat_id in telegram_chat_ids:

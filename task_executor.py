@@ -99,50 +99,29 @@ def escape_markdown(text):
     return text
 
 
-def get_sol_price_usd():
+def get_sol_price_usd(codex_api_key):
     """
-    Current SOL/USD price, cached for SOL_PRICE_CACHE_TTL_SECONDS. Tries CoinGecko
-    first, then falls back to Binance's public ticker if CoinGecko is rate-limited
-    or otherwise unavailable - Binance's public market-data endpoints don't require
-    an API key and have a much higher rate limit than CoinGecko's free tier, which
-    is shared across every app hitting it from Render's free-tier IP pool.
-    Returns None only if both sources fail and there's no usable cached price.
+    Current SOL/USD price via Codex, using the wrapped-SOL mint as the "token" -
+    reuses the same provider/credentials already used for all other token
+    lookups, instead of depending on a separate free-tier price API (CoinGecko)
+    that kept hitting rate limits on Render's shared free-tier IPs.
+    Cached for SOL_PRICE_CACHE_TTL_SECONDS. Returns None only if the lookup
+    fails and there's no usable cached price yet.
     """
     now = time.time()
     with _sol_price_lock:
         if _sol_price_cache["price"] is not None and now - _sol_price_cache["ts"] < SOL_PRICE_CACHE_TTL_SECONDS:
             return _sol_price_cache["price"]
 
-    try:
-        resp = requests.get(
-            "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": "solana", "vs_currencies": "usd"},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        price = resp.json()["solana"]["usd"]
+    token_info = get_token_info(WSOL_MINT, codex_api_key)
+    price = token_info.get("price_usd")
+    if price:
         with _sol_price_lock:
             _sol_price_cache["price"] = price
             _sol_price_cache["ts"] = now
         return price
-    except Exception as e:
-        click.echo(f"SOL price lookup failed (CoinGecko): {e}")
 
-    try:
-        resp = requests.get(
-            "https://api.binance.com/api/v3/ticker/price",
-            params={"symbol": "SOLUSDT"},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        price = float(resp.json()["price"])
-        with _sol_price_lock:
-            _sol_price_cache["price"] = price
-            _sol_price_cache["ts"] = now
-        return price
-    except Exception as e:
-        click.echo(f"SOL price lookup failed (Binance fallback): {e}")
-
+    click.echo("SOL price lookup failed (Codex returned no price for WSOL mint)")
     with _sol_price_lock:
         return _sol_price_cache["price"]  # may still be None, or a stale-but-usable value
 
@@ -432,7 +411,7 @@ def send_discord_notification(webhook_url, wallet_name, wallet_address, action, 
 
 
 def notify(alerts_config, action, wallet_name, wallet_address, token_info, token_mint,
-           token_amount, sol_amount, signature=None):
+           token_amount, sol_amount, codex_api_key, signature=None):
     """
     Compute USD value / holdings % / PnL for a buy or sell, update the cost-basis
     tracker, and fan the alert out to whichever channels are configured.
@@ -441,7 +420,7 @@ def notify(alerts_config, action, wallet_name, wallet_address, token_info, token
     telegram_chat_ids = alerts_config.get("telegram_chat_ids") or []
     discord_webhook = alerts_config.get("discord_webhook")
 
-    sol_price = get_sol_price_usd()
+    sol_price = get_sol_price_usd(codex_api_key)
     # USD value of the token leg, shown next to the token amount in the alert.
     try:
         usd_value = token_amount * float(token_info.get("price_usd") or 0)
@@ -649,10 +628,10 @@ def process_transaction(wallet, tx_result, signature, codex_api_key, alerts_conf
 
     if token_delta > 0:
         notify(alerts_config, "BOUGHT", wallet_name, wallet_address, token_info,
-               token_mint, token_amount, sol_amount, signature=signature)
+               token_mint, token_amount, sol_amount, codex_api_key, signature=signature)
     elif token_delta < 0:
         notify(alerts_config, "SOLD", wallet_name, wallet_address, token_info,
-               token_mint, token_amount, sol_amount, signature=signature)
+               token_mint, token_amount, sol_amount, codex_api_key, signature=signature)
 
 
 def run_tasks_concurrently(wallets, quicknode_url, codex_api_key, alerts_config):

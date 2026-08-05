@@ -4,8 +4,10 @@ import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import click
 
-# global dict for tracking last processed slot for the wallets being tracked
-last_processed_slots = {}
+# Last processed transaction signature per tracked wallet, used with
+# getSignaturesForAddress's `until` param to fetch only new transactions
+# since the last poll.
+last_processed_signatures = {}
 
 # Weighted-average cost basis per (wallet, token), used to compute realized
 # PnL on sells. Lives only in memory - resets if the process restarts, so
@@ -198,38 +200,6 @@ IGNORED_MINTS = {
 }
 
 WSOL_MINT = "So11111111111111111111111111111111111111112"
-
-
-def extract_sol_amount(transaction, wallet_address):
-    """
-    The SOL leg of a swap doesn't always land as a plain native balance change
-    on the wallet's own address. Many aggregator routes (Jupiter etc.) wrap/
-    unwrap SOL through the wallet's *associated WSOL token account* - a
-    different pubkey than the wallet's main address - to move through the
-    route. When that happens, the wallet's own nativeBalanceChange only
-    reflects the network/priority fee it paid (a few thousand to a few
-    hundred-thousand lamports), while the real traded amount shows up as a
-    tokenBalanceChanges entry for the WSOL mint, tagged with `userAccount`
-    equal to the wallet (even though the token *account* itself has its own,
-    different pubkey).
-
-    We take whichever of the two is larger, since a fee-sized native change
-    should never win over a real WSOL-routed trade amount.
-    """
-    native_change = 0.0
-    wsol_change = 0.0
-    for account in transaction.get("accountData", []):
-        if account.get("account") == wallet_address:
-            native_change = abs(account.get("nativeBalanceChange", 0)) / 1e9
-        for tbc in account.get("tokenBalanceChanges", []) or []:
-            if tbc.get("userAccount") == wallet_address and tbc.get("mint") == WSOL_MINT:
-                raw = tbc.get("rawTokenAmount", {}) or {}
-                try:
-                    amt = abs(int(raw.get("tokenAmount", 0))) / (10 ** int(raw.get("decimals", 9)))
-                except (TypeError, ValueError):
-                    amt = 0.0
-                wsol_change += amt
-    return round(max(native_change, wsol_change), 4)
 
 CODEX_GRAPHQL_URL = "https://graph.codex.io/graphql"
 SOLANA_NETWORK_ID = 1399811149
@@ -479,42 +449,58 @@ def notify(alerts_config, action, wallet_name, wallet_address, token_info, token
         )
 
 
-def execute_monitoring(wallet, helius_key, codex_api_key, alerts_config):
+def rpc_call(quicknode_url, method, params, timeout=15):
+    """Call a Solana JSON-RPC method against the configured QuickNode endpoint."""
+    resp = requests.post(
+        quicknode_url,
+        json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if "error" in data:
+        raise RuntimeError(f"{method} RPC error: {data['error']}")
+    return data.get("result")
+
+
+def execute_monitoring(wallet, quicknode_url, codex_api_key, alerts_config):
     wallet_name = wallet["name"]
     wallet_address = wallet["address"]
 
-    if wallet_address not in last_processed_slots:
-        last_processed_slots[wallet_address] = None
+    if wallet_address not in last_processed_signatures:
+        last_processed_signatures[wallet_address] = None
 
     while True:
-        # NOTE: api.helius.xyz has been unreliable / is being phased out for this endpoint.
-        # Helius's current docs only list mainnet.helius-rpc.com as the server for
-        # GET /v0/addresses/{address}/transactions.
-        base_url = f"https://mainnet.helius-rpc.com/v0/addresses/{wallet_address}/transactions"
-        params = {
-            "api-key": helius_key,
-            # Current API takes singular "type" (requests serializes the list as
-            # repeated type=TRANSFER&type=SWAP). The old "types" param is not recognized.
-            "type": ["TRANSFER", "SWAP"],
-            "limit": 5,
-        }
-
         try:
-            response = requests.get(base_url, params=params, timeout=15)
-            response.raise_for_status()
-            transactions = response.json()
+            params = {"limit": 10}
+            last_sig = last_processed_signatures[wallet_address]
+            if last_sig:
+                params["until"] = last_sig
 
-            if transactions:
-                last_processed_slots[wallet_address] = process_transactions(
-                    wallet, transactions, codex_api_key, alerts_config, last_processed_slots[wallet_address]
-                )
+            sig_infos = rpc_call(quicknode_url, "getSignaturesForAddress", [wallet_address, params])
+
+            if sig_infos:
+                # getSignaturesForAddress returns newest-first; process oldest-to-newest
+                # so alerts come out in chronological order.
+                sig_infos = list(reversed(sig_infos))
+                for info in sig_infos:
+                    if info.get("err") is not None:
+                        continue  # skip failed transactions
+
+                    tx_result = rpc_call(
+                        quicknode_url,
+                        "getTransaction",
+                        [info["signature"], {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
+                    )
+                    if tx_result:
+                        process_transaction(wallet, tx_result, info["signature"], codex_api_key, alerts_config)
+
+                last_processed_signatures[wallet_address] = sig_infos[-1]["signature"]
             else:
                 click.echo(f"No new transactions for {wallet_name} ({wallet_address}).")
 
             time.sleep(30)
         except requests.exceptions.RequestException as e:
-            # Include the response body (if any) so a non-200 is actionable in logs
-            # instead of just "500 Server Error: Internal Server Error for url: ...".
             body = ""
             resp = getattr(e, "response", None)
             if resp is not None:
@@ -524,114 +510,105 @@ def execute_monitoring(wallet, helius_key, codex_api_key, alerts_config):
                     pass
             click.echo(f"Error fetching transactions for {wallet_name} - {wallet_address}: {e}{body}")
             time.sleep(60)
+        except Exception as e:
+            click.echo(f"Error processing transactions for {wallet_name} - {wallet_address}: {e}")
+            time.sleep(60)
 
 
-def process_transactions(wallet, transactions, codex_api_key, alerts_config, last_processed_slot):
+def _account_index(tx_result, wallet_address):
+    """Find the wallet's index into preBalances/postBalances via the parsed accountKeys list."""
+    account_keys = tx_result["transaction"]["message"]["accountKeys"]
+    for i, key in enumerate(account_keys):
+        pubkey = key.get("pubkey") if isinstance(key, dict) else key
+        if pubkey == wallet_address:
+            return i
+    return None
+
+
+def _owned_mint_deltas(meta, wallet_address):
+    """
+    {mint: net_ui_amount_change} across all token accounts *owned by* wallet_address,
+    diffing preTokenBalances against postTokenBalances (matched by accountIndex).
+    An account absent from one side (e.g. a freshly-opened or fully-closed token
+    account) is treated as a balance of 0 on that side.
+    """
+    def _map(balances):
+        result = {}
+        for b in balances or []:
+            if b.get("owner") != wallet_address:
+                continue
+            ui = (b.get("uiTokenAmount") or {}).get("uiAmount")
+            mint = b.get("mint")
+            result[mint] = result.get(mint, 0.0) + (float(ui) if ui is not None else 0.0)
+        return result
+
+    pre_map = _map(meta.get("preTokenBalances"))
+    post_map = _map(meta.get("postTokenBalances"))
+    mints = set(pre_map) | set(post_map)
+    return {mint: post_map.get(mint, 0.0) - pre_map.get(mint, 0.0) for mint in mints}
+
+
+def process_transaction(wallet, tx_result, signature, codex_api_key, alerts_config):
+    """
+    Parse one getTransaction (jsonParsed) result and fire a BUY/SELL alert if
+    the wallet's own SOL and token balances moved in a way that looks like a
+    trade. Buy/sell direction and amounts come entirely from diffing
+    pre/post balances - no reliance on any pre-classified "type" field.
+    """
     wallet_address = wallet["address"]
     wallet_name = wallet["name"]
-    transactions = sorted(transactions, key=lambda x: x["slot"])
 
-    latest_slot = last_processed_slot
+    meta = tx_result.get("meta") or {}
+    if meta.get("err") is not None:
+        return  # failed transaction, nothing actually settled
 
-    for transaction in transactions:
-        slot = transaction["slot"]
+    wallet_index = _account_index(tx_result, wallet_address)
 
-        if last_processed_slot and slot <= last_processed_slot:
-            continue
+    # Native SOL leg: the wallet's own lamport balance before vs after. Note this
+    # includes the network/priority fee if the wallet is also the fee payer.
+    native_delta = 0.0
+    if wallet_index is not None and meta.get("preBalances") and meta.get("postBalances"):
+        native_delta = (meta["postBalances"][wallet_index] - meta["preBalances"][wallet_index]) / 1e9
 
-        if not latest_slot or slot > latest_slot:
-            latest_slot = slot
+    mint_deltas = _owned_mint_deltas(meta, wallet_address)
 
-        sol_amount = extract_sol_amount(transaction, wallet_address)
+    # Wrapped SOL leg: some routes move SOL through the wallet's WSOL associated
+    # token account rather than as a plain native transfer, in which case
+    # native_delta alone would only reflect the fee.
+    wsol_delta = mint_deltas.get(WSOL_MINT, 0.0)
+    sol_amount = round(max(abs(native_delta), abs(wsol_delta)), 4)
+    if not sol_amount:
+        return
 
-        # Process SWAP transactions (wallet trades one token for another directly)
-        if transaction["type"] == "SWAP":
-            token_transfers = transaction.get("tokenTransfers", [])
-            if not token_transfers:
-                continue
+    # The traded token is whichever non-SOL/non-stable mint actually moved for
+    # this wallet. If more than one changed (e.g. a multi-hop route touching an
+    # intermediate token), we can't cleanly attribute a single trade, so skip
+    # rather than guess.
+    candidates = [
+        (mint, delta) for mint, delta in mint_deltas.items()
+        if mint not in IGNORED_MINTS and abs(delta) > 1e-9
+    ]
+    if len(candidates) != 1:
+        return
+    token_mint, token_delta = candidates[0]
 
-            if len(token_transfers) == 1:
-                # A single SPL-token leg means the other side of the swap was
-                # native SOL (SOL isn't an SPL token transfer - it shows up as
-                # the nativeBalanceChange we already captured as sol_amount).
-                # This is what Helius reports for most aggregator-routed
-                # (e.g. Jupiter) buys/sells against SOL.
-                leg = token_transfers[0]
-                token_mint = leg["mint"]
-                amount = leg["tokenAmount"]
+    token_amount = abs(token_delta)
+    token_info = get_token_info(token_mint, codex_api_key)
 
-                if token_mint in IGNORED_MINTS or amount <= 0 or not sol_amount:
-                    continue
-
-                token_info = get_token_info(token_mint, codex_api_key)
-                if leg.get("fromUserAccount") == wallet_address:
-                    notify(alerts_config, "SOLD", wallet_name, wallet_address, token_info,
-                           token_mint, amount, sol_amount, signature=transaction.get("signature"))
-                elif leg.get("toUserAccount") == wallet_address:
-                    notify(alerts_config, "BOUGHT", wallet_name, wallet_address, token_info,
-                           token_mint, amount, sol_amount, signature=transaction.get("signature"))
-                continue
-
-            # Two (or more) SPL-token legs: a direct token-to-token swap with
-            # no SOL involved. Resolve the actual outgoing/incoming legs for
-            # this wallet rather than assuming index 0/1, skip it entirely if
-            # either leg is a routing-hop stablecoin, and skip posting anything
-            # if we can't cleanly resolve both sides (rather than post a
-            # message with "N/A" in it).
-            from_token = next((t for t in token_transfers if t.get("fromUserAccount") == wallet_address), None)
-            to_token = next((t for t in token_transfers if t.get("toUserAccount") == wallet_address), None)
-
-            if not from_token or not to_token:
-                continue
-            if from_token["mint"] in IGNORED_MINTS or to_token["mint"] in IGNORED_MINTS:
-                continue
-
-            out_info = get_token_info(from_token["mint"], codex_api_key)
-            in_info = get_token_info(to_token["mint"], codex_api_key)
-            message = (
-                f"\U0001F501 *{escape_markdown(wallet_name)}* SWAPPED\n\n"
-                f"*Sold:* {format_amount(from_token['tokenAmount'])} {escape_markdown(out_info['ticker'])}\n"
-                f"*Bought:* {format_amount(to_token['tokenAmount'])} {escape_markdown(in_info['ticker'])}\n"
-                f"CA (sold): `{from_token['mint']}`\n"
-                f"CA (bought): `{to_token['mint']}`\n"
-                f"Wallet: `{wallet_address}`"
-            )
-            telegram_bot_token = alerts_config.get("telegram_bot_token")
-            telegram_chat_ids = alerts_config.get("telegram_chat_ids") or []
-            if telegram_bot_token and telegram_chat_ids:
-                # Buttons trade the newly-acquired token, since that's the position going forward.
-                keyboard = build_trading_bot_keyboard(to_token["mint"])
-                for chat_id in telegram_chat_ids:
-                    send_telegram_notification(telegram_bot_token, chat_id, message, reply_markup=keyboard)
-
-        # Process TRANSFER transactions (simple buy/sell)
-        elif transaction["type"] == "TRANSFER":
-            for token_transfer in transaction.get("tokenTransfers", []):
-                token_mint = token_transfer["mint"]
-                amount = token_transfer["tokenAmount"]
-
-                if token_mint in IGNORED_MINTS or amount <= 0:
-                    continue
-
-                if token_transfer.get("toUserAccount") == wallet_address:
-                    token_info = get_token_info(token_mint, codex_api_key)
-                    notify(alerts_config, "BOUGHT", wallet_name, wallet_address, token_info,
-                           token_mint, amount, sol_amount, signature=transaction.get("signature"))
-
-                elif token_transfer.get("fromUserAccount") == wallet_address:
-                    token_info = get_token_info(token_mint, codex_api_key)
-                    notify(alerts_config, "SOLD", wallet_name, wallet_address, token_info,
-                           token_mint, amount, sol_amount, signature=transaction.get("signature"))
-
-    return latest_slot
+    if token_delta > 0:
+        notify(alerts_config, "BOUGHT", wallet_name, wallet_address, token_info,
+               token_mint, token_amount, sol_amount, signature=signature)
+    elif token_delta < 0:
+        notify(alerts_config, "SOLD", wallet_name, wallet_address, token_info,
+               token_mint, token_amount, sol_amount, signature=signature)
 
 
-def run_tasks_concurrently(wallets, helius_api_key, codex_api_key, alerts_config):
+def run_tasks_concurrently(wallets, quicknode_url, codex_api_key, alerts_config):
     """Run monitoring tasks concurrently for all wallets with a small delay between task starts."""
 
     def execute_with_delay(wallet):
         time.sleep(2)
-        execute_monitoring(wallet, helius_api_key, codex_api_key, alerts_config)
+        execute_monitoring(wallet, quicknode_url, codex_api_key, alerts_config)
 
     # Each wallet's monitoring loop runs forever (it's a `while True`), so it holds
     # its worker thread for the lifetime of the process rather than returning it to

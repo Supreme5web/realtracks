@@ -39,10 +39,10 @@ def start_tracking_background():
     try:
         wallets = load_wallets_from_env()
 
-        helius_api_key = os.environ.get("HELIUS_API_KEY")
+        quicknode_url = os.environ.get("QUICKNODE_RPC_URL")
         codex_api_key = os.environ.get("CODEX_API_KEY")
-        if not helius_api_key:
-            raise ValueError("HELIUS_API_KEY env var is not set")
+        if not quicknode_url:
+            raise ValueError("QUICKNODE_RPC_URL env var is not set")
         if not codex_api_key:
             raise ValueError("CODEX_API_KEY env var is not set")
 
@@ -68,7 +68,7 @@ def start_tracking_background():
         tracker_status["error"] = None
 
         print(f"[SolTracker] Starting tracking for {len(wallets)} wallet(s)", flush=True)
-        run_tasks_concurrently(wallets, helius_api_key, codex_api_key, alerts_config)
+        run_tasks_concurrently(wallets, quicknode_url, codex_api_key, alerts_config)
 
     except Exception as e:
         tracker_status["started"] = False

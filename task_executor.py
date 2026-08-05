@@ -294,20 +294,25 @@ def format_market_cap(value):
     return f"${sign}{s}{suffix}"
 
 
+def _trim_trailing_zero_decimals(formatted_amount):
+    """'31,111,261.00' -> '31,111,261', but '31,111,261.42' is left alone."""
+    return formatted_amount[:-3] if formatted_amount.endswith(".00") else formatted_amount
+
+
 def build_buy_message(wallet_name, wallet_address, token_info, token_amount, sol_amount,
                        usd_value, token_mint):
     safe_wallet_name = escape_markdown(wallet_name)
     safe_ticker = escape_markdown(token_info["ticker"])
     cap = format_market_cap(token_info["market_cap"])
-    token_link = f"https://solscan.io/token/{token_mint}"
+    amount = _trim_trailing_zero_decimals(format_amount(token_amount))
 
     return (
-        f"\U0001F7E2 *{safe_wallet_name}* BOUGHT\n"
-        f"Token: [#{safe_ticker}]({token_link})\n"
-        f"Spent: {format_sol(sol_amount)} SOL\n"
-        f"Received: {format_amount(token_amount)} {safe_ticker}\n"
-        f"Market Cap: {cap}\n"
-        f"CA: `{token_mint}`"
+        f"\U0001F7E2 *BUY*\n"
+        f"*{safe_wallet_name}* bought {amount} *{safe_ticker}*\n"
+        f"*Spent:* {format_sol(sol_amount)} SOL ({format_usd(usd_value)})\n"
+        f"*Entry:* {cap} *MC*\n"
+        f"*CA:* `{token_mint}`\n"
+        f"*Wallet:* `{wallet_address}`"
     )
 
 
@@ -316,17 +321,18 @@ def build_sell_message(wallet_name, wallet_address, token_info, token_amount, so
     safe_wallet_name = escape_markdown(wallet_name)
     safe_ticker = escape_markdown(token_info["ticker"])
     cap = format_market_cap(token_info["market_cap"])
-    token_link = f"https://solscan.io/token/{token_mint}"
+    amount = _trim_trailing_zero_decimals(format_amount(token_amount))
 
     lines = [
-        f"\U0001F534 *{safe_wallet_name}* SOLD",
-        f"Token: [#{safe_ticker}]({token_link})",
-        f"Received: {format_sol(sol_amount)} SOL",
-        f"Market Cap: {cap}",
+        f"\U0001F534 *SELL*",
+        f"*{safe_wallet_name}* sold {amount} *{safe_ticker}*",
+        f"*Received:* {format_sol(sol_amount)} SOL ({format_usd(usd_value)})",
     ]
     if pnl_usd is not None and pnl_pct is not None:
-        lines.append(f"PnL: {format_usd(pnl_usd, signed=True)} ({format_signed_pct(pnl_pct)})")
-    lines.append(f"CA: `{token_mint}`")
+        lines.append(f"\U0001F4C8 PnL: {format_usd(pnl_usd, signed=True)} ({format_signed_pct(pnl_pct)})")
+    lines.append(f"*MC:* {cap}")
+    lines.append(f"*CA:* `{token_mint}`")
+    lines.append(f"*Wallet:* `{wallet_address}`")
     return "\n".join(lines)
 
 

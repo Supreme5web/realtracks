@@ -274,20 +274,40 @@ def get_token_info(token_mint, codex_api_key):
         return defaults
 
 
+def format_market_cap(value):
+    """Compact, trimmed market cap for the Telegram alert layout, e.g. 2800000 -> '$2.8M'."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "N/A"
+    sign = "-" if value < 0 else ""
+    value = abs(value)
+    if value >= 1_000_000_000:
+        num, suffix = value / 1_000_000_000, "B"
+    elif value >= 1_000_000:
+        num, suffix = value / 1_000_000, "M"
+    elif value >= 1_000:
+        num, suffix = value / 1_000, "K"
+    else:
+        num, suffix = value, ""
+    s = f"{num:.2f}".rstrip("0").rstrip(".")
+    return f"${sign}{s}{suffix}"
+
+
 def build_buy_message(wallet_name, wallet_address, token_info, token_amount, sol_amount,
                        usd_value, token_mint):
     safe_wallet_name = escape_markdown(wallet_name)
     safe_ticker = escape_markdown(token_info["ticker"])
-    cap = format_compact_number(token_info["market_cap"])
+    cap = format_market_cap(token_info["market_cap"])
     token_link = f"https://solscan.io/token/{token_mint}"
 
     return (
-        f"\U0001F7E2 *BUY ALERT*\n\n"
-        f"*{safe_wallet_name}* swapped {format_sol(sol_amount)} SOL \u2192 "
-        f"{format_amount(token_amount)} ({format_usd(usd_value)}) "
-        f"[#{safe_ticker}]({token_link}) at {cap} MC\n\n"
-        f"CA: `{token_mint}`\n"
-        f"Wallet: `{wallet_address}`"
+        f"\U0001F7E2 *{safe_wallet_name}* BOUGHT\n"
+        f"Token: [#{safe_ticker}]({token_link})\n"
+        f"Spent: {format_sol(sol_amount)} SOL\n"
+        f"Received: {format_amount(token_amount)} {safe_ticker}\n"
+        f"Market Cap: {cap}\n"
+        f"CA: `{token_mint}`"
     )
 
 
@@ -295,20 +315,18 @@ def build_sell_message(wallet_name, wallet_address, token_info, token_amount, so
                         usd_value, token_mint, pnl_usd, pnl_pct):
     safe_wallet_name = escape_markdown(wallet_name)
     safe_ticker = escape_markdown(token_info["ticker"])
-    cap = format_compact_number(token_info["market_cap"])
+    cap = format_market_cap(token_info["market_cap"])
     token_link = f"https://solscan.io/token/{token_mint}"
 
     lines = [
-        f"\U0001F534 *SELL ALERT*",
-        "",
-        f"*{safe_wallet_name}* swapped {format_amount(token_amount)} ({format_usd(usd_value)}) "
-        f"[#{safe_ticker}]({token_link}) \u2192 {format_sol(sol_amount)} SOL at {cap} MC",
-        "",
+        f"\U0001F534 *{safe_wallet_name}* SOLD",
+        f"Token: [#{safe_ticker}]({token_link})",
+        f"Received: {format_sol(sol_amount)} SOL",
+        f"Market Cap: {cap}",
     ]
     if pnl_usd is not None and pnl_pct is not None:
         lines.append(f"PnL: {format_usd(pnl_usd, signed=True)} ({format_signed_pct(pnl_pct)})")
     lines.append(f"CA: `{token_mint}`")
-    lines.append(f"Wallet: `{wallet_address}`")
     return "\n".join(lines)
 
 

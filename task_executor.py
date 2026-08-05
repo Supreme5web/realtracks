@@ -197,6 +197,40 @@ IGNORED_MINTS = {
     "So11111111111111111111111111111111111111112",  # Wrapped SOL
 }
 
+WSOL_MINT = "So11111111111111111111111111111111111111112"
+
+
+def extract_sol_amount(transaction, wallet_address):
+    """
+    The SOL leg of a swap doesn't always land as a plain native balance change
+    on the wallet's own address. Many aggregator routes (Jupiter etc.) wrap/
+    unwrap SOL through the wallet's *associated WSOL token account* - a
+    different pubkey than the wallet's main address - to move through the
+    route. When that happens, the wallet's own nativeBalanceChange only
+    reflects the network/priority fee it paid (a few thousand to a few
+    hundred-thousand lamports), while the real traded amount shows up as a
+    tokenBalanceChanges entry for the WSOL mint, tagged with `userAccount`
+    equal to the wallet (even though the token *account* itself has its own,
+    different pubkey).
+
+    We take whichever of the two is larger, since a fee-sized native change
+    should never win over a real WSOL-routed trade amount.
+    """
+    native_change = 0.0
+    wsol_change = 0.0
+    for account in transaction.get("accountData", []):
+        if account.get("account") == wallet_address:
+            native_change = abs(account.get("nativeBalanceChange", 0)) / 1e9
+        for tbc in account.get("tokenBalanceChanges", []) or []:
+            if tbc.get("userAccount") == wallet_address and tbc.get("mint") == WSOL_MINT:
+                raw = tbc.get("rawTokenAmount", {}) or {}
+                try:
+                    amt = abs(int(raw.get("tokenAmount", 0))) / (10 ** int(raw.get("decimals", 9)))
+                except (TypeError, ValueError):
+                    amt = 0.0
+                wsol_change += amt
+    return round(max(native_change, wsol_change), 4)
+
 CODEX_GRAPHQL_URL = "https://graph.codex.io/graphql"
 SOLANA_NETWORK_ID = 1399811149
 
@@ -508,13 +542,7 @@ def process_transactions(wallet, transactions, codex_api_key, alerts_config, las
         if not latest_slot or slot > latest_slot:
             latest_slot = slot
 
-        sol_amount = round(
-            next(
-                (abs(account["nativeBalanceChange"]) / 1e9 for account in transaction.get("accountData", []) if account["account"] == wallet_address),
-                0.0,
-            ),
-            4,
-        )
+        sol_amount = extract_sol_amount(transaction, wallet_address)
 
         # Process SWAP transactions (wallet trades one token for another directly)
         if transaction["type"] == "SWAP":

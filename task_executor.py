@@ -262,9 +262,19 @@ def get_token_info(token_mint, codex_api_key):
 
         result = results[0]
         token = result.get("token") or {}
-        # marketCap is fully-diluted; fall back to circulatingMarketCap if unset
-        market_cap = result.get("marketCap") or result.get("circulatingMarketCap") or 0
-        price_usd = result.get("priceUSD") or 0
+        # marketCap is fully-diluted; fall back to circulatingMarketCap if unset.
+        # Codex returns these as strings over GraphQL, so cast to float here -
+        # otherwise downstream arithmetic (e.g. sol_amount * price_usd) blows up
+        # with "can't multiply sequence by non-int of type 'float'".
+        try:
+            market_cap = float(result.get("marketCap") or result.get("circulatingMarketCap") or 0)
+        except (TypeError, ValueError):
+            market_cap = 0
+
+        try:
+            price_usd = float(result.get("priceUSD") or 0)
+        except (TypeError, ValueError):
+            price_usd = 0
 
         return {
             "market_cap": market_cap,

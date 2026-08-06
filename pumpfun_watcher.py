@@ -266,6 +266,15 @@ def send_telegram_alert(name, symbol, mint, market_cap_usd):
 
     extra = fetch_solana_tracker_info(mint)
 
+    # Skip coins with no socials at all. If the lookup itself failed (no API
+    # key, timeout, bad response) we can't know either way, so we fail open
+    # and still send the alert rather than silently dropping it.
+    if extra is not None:
+        has_socials = bool(extra.get("twitter") or extra.get("telegram") or extra.get("website"))
+        if not has_socials:
+            print(f"[PumpAlert] Skipping alert for {mint} - no socials found", flush=True)
+            return
+
     lines = [
         f"\U0001F680 *{name}* (${symbol})",
         f"*MC:* ${market_cap_usd:,.0f}",

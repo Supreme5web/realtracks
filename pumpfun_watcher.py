@@ -26,6 +26,13 @@ else:
 SOLANA_WS_URL = os.environ.get("SOLANA_WS_URL", _default_ws)
 SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", _default_rpc)
 
+# Used only for enriching the outgoing alert (buys/sells, volume, age,
+# price, socials) - never touches detection/tracking. Sign up at
+# solanatracker.io for a key. If unset, alerts just fall back to the
+# original name/CA/MC-only format.
+SOLANA_TRACKER_API_KEY = os.environ.get("SOLANA_TRACKER_API_KEY", "")
+SOLANA_TRACKER_BASE_URL = "https://data.solanatracker.io"
+
 MIN_MARKET_CAP_USD = float(os.environ.get("MIN_MARKET_CAP_USD", "12000"))
 POLL_INTERVAL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "5"))
 # How long we'll keep polling a mint for before giving up if it never hits
@@ -171,6 +178,85 @@ def fetch_market_caps(mints):
     return out
 
 
+def fetch_solana_tracker_info(mint):
+    """Best-effort lookup of buys/sells, volume, age, price, and socials for
+    a mint via the Solana Tracker API. Called once, at alert time - never
+    part of the detection/polling loop. Returns None on any failure (missing
+    key, timeout, bad response, etc) so a slow/broken lookup never blocks
+    the core alert from going out."""
+    if not SOLANA_TRACKER_API_KEY:
+        return None
+    try:
+        resp = requests.get(
+            f"{SOLANA_TRACKER_BASE_URL}/tokens/{mint}",
+            headers={"x-api-key": SOLANA_TRACKER_API_KEY},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        print(f"[PumpAlert] Solana Tracker fetch failed for {mint}: {e}", flush=True)
+        return None
+
+    token_info = data.get("token") or {}
+    pools = data.get("pools") or []
+    pool = pools[0] if pools else {}
+    txns = pool.get("txns") or {}
+    price = pool.get("price") or {}
+
+    volume_usd = txns.get("volume24h")
+    if volume_usd is None:
+        vol = txns.get("volume")
+        volume_usd = vol.get("usd") if isinstance(vol, dict) else vol
+
+    age_seconds = None
+    created_at = pool.get("createdAt")
+    if created_at:
+        try:
+            age_seconds = max(0, time.time() - (float(created_at) / 1000))
+        except (TypeError, ValueError):
+            age_seconds = None
+
+    return {
+        "buys": txns.get("buys"),
+        "sells": txns.get("sells"),
+        "volume_usd": volume_usd,
+        "price_usd": price.get("usd"),
+        "age_seconds": age_seconds,
+        "twitter": token_info.get("twitter"),
+        "telegram": token_info.get("telegram"),
+        "website": token_info.get("website"),
+    }
+
+
+def _format_age(age_seconds):
+    if age_seconds is None:
+        return None
+    age_seconds = int(age_seconds)
+    if age_seconds < 60:
+        return f"{age_seconds}s"
+    minutes = age_seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {minutes}m"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours}h"
+
+
+def _format_price(price_usd):
+    if price_usd is None:
+        return None
+    try:
+        price_usd = float(price_usd)
+    except (TypeError, ValueError):
+        return None
+    if price_usd < 0.01:
+        return f"${price_usd:.8f}".rstrip("0").rstrip(".")
+    return f"${price_usd:,.4f}"
+
+
 def send_telegram_alert(name, symbol, mint, market_cap_usd):
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_ids = [c.strip() for c in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if c.strip()]
@@ -178,13 +264,47 @@ def send_telegram_alert(name, symbol, mint, market_cap_usd):
         print("[PumpAlert] Can't send alert - TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set", flush=True)
         return
 
-    text = (
-        f"\U0001F680 *{name}* (${symbol})\n"
-        f"*MC:* ${market_cap_usd:,.0f}\n"
-        f"*CA:* `{mint}`\n"
+    extra = fetch_solana_tracker_info(mint)
+
+    lines = [
+        f"\U0001F680 *{name}* (${symbol})",
+        f"*MC:* ${market_cap_usd:,.0f}",
+    ]
+
+    if extra:
+        price_str = _format_price(extra.get("price_usd"))
+        if price_str:
+            lines.append(f"*Price:* {price_str}")
+
+        age_str = _format_age(extra.get("age_seconds"))
+        if age_str:
+            lines.append(f"*Age:* {age_str}")
+
+        buys, sells = extra.get("buys"), extra.get("sells")
+        if buys is not None and sells is not None:
+            lines.append(f"*Buys/Sells:* {buys}/{sells}")
+
+        if extra.get("volume_usd") is not None:
+            lines.append(f"*Volume:* ${float(extra['volume_usd']):,.0f}")
+
+        socials = []
+        if extra.get("twitter"):
+            socials.append(f"[Twitter]({extra['twitter']})")
+        if extra.get("telegram"):
+            socials.append(f"[Telegram]({extra['telegram']})")
+        if extra.get("website"):
+            socials.append(f"[Website]({extra['website']})")
+        if socials:
+            lines.append(" | ".join(socials))
+
+    lines.append(f"*CA:* `{mint}`")
+    lines.append(
         f"[DexScreener](https://dexscreener.com/solana/{mint}) | "
         f"[pump.fun](https://pump.fun/{mint})"
     )
+
+    text = "\n".join(lines)
+
     for chat_id in chat_ids:
         try:
             requests.post(

@@ -1,7 +1,6 @@
 import os
 import json
 import time
-import hashlib
 import asyncio
 import threading
 
@@ -13,25 +12,18 @@ import websockets
 # ---------------------------------------------------------------------------
 PUMP_FUN_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
-# Prefer Helius if a key is provided - much higher rate limits and a far
-# more stable websocket than the public RPC. Falls back to public endpoints
-# (or explicit SOLANA_WS_URL/SOLANA_RPC_URL overrides) if no key is set.
-HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY", "")
-if HELIUS_API_KEY:
-    _default_ws = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
-    _default_rpc = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
-else:
-    _default_ws = "wss://api.mainnet-beta.solana.com"
-    _default_rpc = "https://api.mainnet-beta.solana.com"
-
-SOLANA_WS_URL = os.environ.get("SOLANA_WS_URL", _default_ws)
-SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", _default_rpc)
+# Public RPC by default. Free public endpoints are heavily rate-limited and
+# sometimes drop long-lived websocket connections - swap in a free-tier
+# Helius/QuickNode/Shyft RPC+WS pair via env vars if you see frequent
+# reconnects or 429s.
+SOLANA_WS_URL = os.environ.get("SOLANA_WS_URL", "wss://api.mainnet-beta.solana.com")
+SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 
 MIN_MARKET_CAP_USD = float(os.environ.get("MIN_MARKET_CAP_USD", "12000"))
 POLL_INTERVAL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "5"))
 # How long we'll keep polling a mint for before giving up if it never hits
 # the mcap target (or never shows up on DexScreener at all).
-MAX_TRACK_AGE_SECONDS = float(os.environ.get("MAX_TRACK_AGE_SECONDS", "600"))  # 10 min
+MAX_TRACK_AGE_SECONDS = float(os.environ.get("MAX_TRACK_AGE_SECONDS", "1800"))  # 30 min
 
 # Throttling to stay under free-tier rate limits.
 RPC_MIN_INTERVAL_SECONDS = float(os.environ.get("RPC_MIN_INTERVAL_SECONDS", "0.25"))  # ~4 req/s
@@ -40,33 +32,8 @@ DEXSCREENER_BATCH_SIZE = 30  # DexScreener's /tokens/ endpoint accepts up to 30 
 
 # Log line Anchor emits for the pump.fun "create" instruction. logsSubscribe
 # is already filtered to txs that mention the program, so this line is what
-# actually distinguishes "new mint" from every buy/sell/other tx on it. It's
-# only a cheap pre-filter though - the log line alone doesn't prove *which*
-# program in the tx emitted it, since sniper/launcher bots (Bloom, BullX,
-# Trojan, etc.) commonly CPI into pump.fun from a wrapper program. The real
-# check happens in get_mint_from_signature via the instruction discriminator.
+# actually distinguishes "new mint" from every buy/sell/other tx on it.
 CREATE_LOG_MARKER = "Program log: Instruction: Create"
-
-# Anchor instruction discriminator = first 8 bytes of sha256("global:<ix_name>").
-# This is what actually identifies pump.fun's own `create` instruction,
-# regardless of whether it's a top-level instruction or reached via CPI.
-CREATE_IX_DISCRIMINATOR = list(hashlib.sha256(b"global:create").digest()[:8])
-
-_B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-_B58_INDEX = {c: i for i, c in enumerate(_B58_ALPHABET)}
-
-
-def b58decode(s):
-    """Minimal base58 decoder (Bitcoin/Solana alphabet) - avoids depending
-    on the external `base58` package."""
-    if not s:
-        return b""
-    num = 0
-    for ch in s:
-        num = num * 58 + _B58_INDEX[ch]
-    combined = num.to_bytes((num.bit_length() + 7) // 8, "big") if num else b""
-    n_leading_zeros = len(s) - len(s.lstrip("1"))
-    return b"\x00" * n_leading_zeros + combined
 
 # ---------------------------------------------------------------------------
 # Shared state
@@ -125,28 +92,9 @@ def rpc_call(method, params, max_retries=4):
 
 def get_mint_from_signature(signature, retries=4, delay=1.0):
     """Fetch the tx behind a create-log signature and pull the mint address
-    out of it.
-
-    Uses encoding="json" (raw, unparsed) rather than "jsonParsed" - Helius
-    (and possibly other enhanced RPCs) maintain custom parsers for popular
-    third-party programs like pump.fun, which can return instructions as a
-    structured `parsed` object instead of the generic accounts/data shape.
-    Relying on that shape silently breaks the moment the provider changes
-    how it parses the program. Raw "json" encoding never special-cases any
-    program, so accounts always come back as index positions into
-    accountKeys - slightly more work, but immune to that kind of surprise.
-
-    Per pump.fun's Anchor IDL, the `create` instruction's accounts are:
-    [mint, mint_authority, bonding_curve, associated_bonding_curve, global, ...]
-    so index 0 is the new mint and index 3 is the ATA holding the unsold
-    supply pre-migration. Checks both top-level and inner (CPI) instructions,
-    since many creates are routed through a launcher/sniper-bot program
-    rather than calling pump.fun directly. A match requires the instruction's
-    programId to be pump.fun's AND its data to start with pump.fun's `create`
-    discriminator - programId alone isn't enough since other instructions in
-    the same tx can also target pump.fun (e.g. the immediate post-create buy).
-
-    Returns (mint, bonding_curve_ata) or (None, None).
+    out of it. The pump.fun `create` instruction's account order (per its
+    Anchor IDL) puts the new mint at index 0. Retries a few times since the
+    tx isn't always fetchable the instant we get the log notification.
     """
     for attempt in range(retries):
         result = rpc_call(
@@ -154,7 +102,7 @@ def get_mint_from_signature(signature, retries=4, delay=1.0):
             [
                 signature,
                 {
-                    "encoding": "json",
+                    "encoding": "jsonParsed",
                     "maxSupportedTransactionVersion": 0,
                     "commitment": "confirmed",
                 },
@@ -162,47 +110,17 @@ def get_mint_from_signature(signature, retries=4, delay=1.0):
         )
         if result:
             try:
-                message = result["transaction"]["message"]
-                account_keys = list(message.get("accountKeys") or [])
-                loaded = (result.get("meta") or {}).get("loadedAddresses") or {}
-                account_keys += list(loaded.get("writable") or [])
-                account_keys += list(loaded.get("readonly") or [])
-
-                if PUMP_FUN_PROGRAM_ID not in account_keys:
-                    return None, None
-                pump_idx = account_keys.index(PUMP_FUN_PROGRAM_ID)
-
-                candidates = list(message.get("instructions") or [])
-                for inner in (result.get("meta") or {}).get("innerInstructions") or []:
-                    candidates.extend(inner.get("instructions") or [])
-            except (KeyError, TypeError):
-                candidates, account_keys, pump_idx = [], [], -1
-
-            for ix in candidates:
-                if ix.get("programIdIndex") != pump_idx:
-                    continue
-                data = ix.get("data")
-                if not data:
-                    continue
-                try:
-                    raw = b58decode(data)
-                except Exception:
-                    continue
-                if list(raw[:8]) != CREATE_IX_DISCRIMINATOR:
-                    continue
-                acc_indices = ix.get("accounts") or []
-                if not acc_indices:
-                    continue
-                try:
-                    mint = account_keys[acc_indices[0]]
-                    bonding_curve_ata = account_keys[acc_indices[3]] if len(acc_indices) > 3 else None
-                except IndexError:
-                    continue
-                return mint, bonding_curve_ata
-
-            return None, None  # tx fetched fine but no matching create instruction found
+                instructions = result["transaction"]["message"]["instructions"]
+                for ix in instructions:
+                    if ix.get("programId") == PUMP_FUN_PROGRAM_ID:
+                        accounts = ix.get("accounts")
+                        if accounts:
+                            return accounts[0]
+            except (KeyError, TypeError, IndexError):
+                pass
+            return None  # tx fetched fine but no matching instruction found
         time.sleep(delay)
-    return None, None
+    return None
 
 
 def fetch_market_caps(mints):
@@ -284,7 +202,7 @@ def _handle_create_signature(signature):
     """Runs in a worker thread: resolve the mint for a create-tx signature
     and add it to the tracked set. Kept off the asyncio loop since it does
     blocking HTTP calls."""
-    mint, bonding_curve_ata = get_mint_from_signature(signature)
+    mint = get_mint_from_signature(signature)
     if not mint:
         print(f"[PumpAlert] Could not resolve mint for signature {signature}", flush=True)
         return
@@ -297,7 +215,6 @@ def _handle_create_signature(signature):
             "alerted": False,
             "name": None,
             "symbol": None,
-            "bonding_curve_ata": bonding_curve_ata,
         }
         watcher_status["tokens_tracking"] = len(tracked_tokens)
     print(f"[PumpAlert] New mint tracked: {mint}", flush=True)

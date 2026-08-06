@@ -12,22 +12,19 @@ services:
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
-      # Set this and the RPC/WS URLs auto-build against Helius. Leave unset
-      # to fall back to the public (rate-limited) Solana RPC instead.
-      - key: HELIUS_API_KEY
-        sync: false
+      # Public RPC by default (free, but rate-limited and websocket can be
+      # flaky). Override with a free-tier Helius/QuickNode/Shyft RPC+WS pair
+      # if you see frequent reconnects or 429s in the logs.
+      - key: SOLANA_WS_URL
+        value: "wss://api.mainnet-beta.solana.com"
+      - key: SOLANA_RPC_URL
+        value: "https://api.mainnet-beta.solana.com"
       - key: MIN_MARKET_CAP_USD
         value: "12000"
-      - key: MAX_MARKET_CAP_USD
-        value: "60000"
-      - key: MAX_TOP10_HOLDER_PCT
-        value: "60"
-      - key: HOLDER_CHECK_COOLDOWN_SECONDS
-        value: "15"
       - key: POLL_INTERVAL_SECONDS
         value: "5"
       - key: MAX_TRACK_AGE_SECONDS
-        value: "600"
+        value: "1800"
       - key: RPC_MIN_INTERVAL_SECONDS
         value: "0.25"
       - key: DEXSCREENER_MIN_INTERVAL_SECONDS

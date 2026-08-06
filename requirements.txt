@@ -4,3 +4,4 @@ typing-extensions==4.12.2
 flask==3.1.0
 gunicorn==23.0.0
 websockets==13.1
+base58==2.1.1

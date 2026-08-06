@@ -7,6 +7,7 @@ import threading
 
 import requests
 import websockets
+import base58
 
 # ---------------------------------------------------------------------------
 # Config (env vars)
@@ -28,20 +29,10 @@ SOLANA_WS_URL = os.environ.get("SOLANA_WS_URL", _default_ws)
 SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", _default_rpc)
 
 MIN_MARKET_CAP_USD = float(os.environ.get("MIN_MARKET_CAP_USD", "12000"))
-MAX_MARKET_CAP_USD = float(os.environ.get("MAX_MARKET_CAP_USD", "60000"))
 POLL_INTERVAL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "5"))
 # How long we'll keep polling a mint for before giving up if it never hits
 # the mcap target (or never shows up on DexScreener at all).
 MAX_TRACK_AGE_SECONDS = float(os.environ.get("MAX_TRACK_AGE_SECONDS", "600"))  # 10 min
-
-# Rug filter: skip alerting if the top 10 non-bonding-curve holders control
-# this much or more of total supply. The bonding curve's own token account
-# is excluded from this calc since it legitimately holds most of the unsold
-# supply pre-migration - that's the mechanism, not a red flag.
-MAX_TOP10_HOLDER_PCT = float(os.environ.get("MAX_TOP10_HOLDER_PCT", "60"))
-# Don't re-run the (2 extra RPC calls) holder check more than this often per
-# mint - it only matters for mints currently sitting in the alert window.
-HOLDER_CHECK_COOLDOWN_SECONDS = float(os.environ.get("HOLDER_CHECK_COOLDOWN_SECONDS", "15"))
 
 # Throttling to stay under free-tier rate limits.
 RPC_MIN_INTERVAL_SECONDS = float(os.environ.get("RPC_MIN_INTERVAL_SECONDS", "0.25"))  # ~4 req/s
@@ -61,23 +52,6 @@ CREATE_LOG_MARKER = "Program log: Instruction: Create"
 # This is what actually identifies pump.fun's own `create` instruction,
 # regardless of whether it's a top-level instruction or reached via CPI.
 CREATE_IX_DISCRIMINATOR = list(hashlib.sha256(b"global:create").digest()[:8])
-
-_B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-_B58_INDEX = {c: i for i, c in enumerate(_B58_ALPHABET)}
-
-
-def b58decode(s):
-    """Minimal base58 decoder (Bitcoin/Solana alphabet) - avoids depending
-    on the external `base58` package, which isn't worth the risk of another
-    missed-dependency deploy failure for ~15 lines of code."""
-    if not s:
-        return b""
-    num = 0
-    for ch in s:
-        num = num * 58 + _B58_INDEX[ch]
-    combined = num.to_bytes((num.bit_length() + 7) // 8, "big") if num else b""
-    n_leading_zeros = len(s) - len(s.lstrip("1"))
-    return b"\x00" * n_leading_zeros + combined
 
 # ---------------------------------------------------------------------------
 # Shared state
@@ -145,7 +119,7 @@ def _is_create_ix(ix):
     if not data:
         return False
     try:
-        raw = b58decode(data)
+        raw = base58.b58decode(data)
     except Exception:
         return False
     return list(raw[:8]) == CREATE_IX_DISCRIMINATOR
@@ -153,17 +127,12 @@ def _is_create_ix(ix):
 
 def get_mint_from_signature(signature, retries=4, delay=1.0):
     """Fetch the tx behind a create-log signature and pull the mint address
-    (and bonding-curve token account) out of it. Per pump.fun's Anchor IDL,
-    the `create` instruction's accounts are ordered:
-    [mint, mint_authority, bonding_curve, associated_bonding_curve, global, ...]
-    so index 0 is the new mint and index 3 is the ATA that holds the unsold
-    supply pre-migration (needed later to exclude it from holder-% checks).
-    Checks both top-level and inner (CPI) instructions, since many creates
-    are routed through a launcher/sniper-bot program rather than calling
-    pump.fun directly. Retries a few times since the tx isn't always
-    fetchable the instant we get the log notification.
-
-    Returns (mint, bonding_curve_ata) or (None, None).
+    out of it. The pump.fun `create` instruction's account order (per its
+    Anchor IDL) puts the new mint at index 0. Checks both top-level
+    instructions and inner (CPI) instructions, since many creates are routed
+    through a launcher/sniper-bot program rather than calling pump.fun
+    directly. Retries a few times since the tx isn't always fetchable the
+    instant we get the log notification.
     """
     for attempt in range(retries):
         result = rpc_call(
@@ -189,34 +158,10 @@ def get_mint_from_signature(signature, retries=4, delay=1.0):
                 if _is_create_ix(ix):
                     accounts = ix.get("accounts")
                     if accounts:
-                        mint = accounts[0]
-                        bonding_curve_ata = accounts[3] if len(accounts) > 3 else None
-                        return mint, bonding_curve_ata
-            return None, None  # tx fetched fine but no matching create instruction found
+                        return accounts[0]
+            return None  # tx fetched fine but no matching create instruction found
         time.sleep(delay)
-    return None, None
-
-
-def get_top10_holder_pct(mint, exclude_account):
-    """Returns the % of total supply held by the top 10 token accounts,
-    excluding `exclude_account` (the bonding curve's own ATA). Returns None
-    if either RPC call fails - callers should treat that as "unknown, try
-    again later" rather than a rejection."""
-    largest = rpc_call("getTokenLargestAccounts", [mint])
-    supply = rpc_call("getTokenSupply", [mint])
-    if not largest or not supply:
-        return None
-    try:
-        accounts = largest.get("value") or []
-        total = int(supply["value"]["amount"])
-        if total <= 0:
-            return None
-        filtered = [a for a in accounts if a.get("address") != exclude_account]
-        filtered.sort(key=lambda a: int(a.get("amount", 0)), reverse=True)
-        top10_sum = sum(int(a.get("amount", 0)) for a in filtered[:10])
-        return (top10_sum / total) * 100
-    except (KeyError, TypeError, ValueError):
-        return None
+    return None
 
 
 def fetch_market_caps(mints):
@@ -260,18 +205,16 @@ def fetch_market_caps(mints):
     return out
 
 
-def send_telegram_alert(name, symbol, mint, market_cap_usd, top10_pct=None):
+def send_telegram_alert(name, symbol, mint, market_cap_usd):
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_ids = [c.strip() for c in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if c.strip()]
     if not token or not chat_ids:
         print("[PumpAlert] Can't send alert - TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set", flush=True)
         return
 
-    holder_line = f"*Top 10 holders:* {top10_pct:.1f}%\n" if top10_pct is not None else ""
     text = (
         f"\U0001F680 *{name}* (${symbol})\n"
         f"*MC:* ${market_cap_usd:,.0f}\n"
-        f"{holder_line}"
         f"*CA:* `{mint}`\n"
         f"[DexScreener](https://dexscreener.com/solana/{mint}) | "
         f"[pump.fun](https://pump.fun/{mint})"
@@ -300,7 +243,7 @@ def _handle_create_signature(signature):
     """Runs in a worker thread: resolve the mint for a create-tx signature
     and add it to the tracked set. Kept off the asyncio loop since it does
     blocking HTTP calls."""
-    mint, bonding_curve_ata = get_mint_from_signature(signature)
+    mint = get_mint_from_signature(signature)
     if not mint:
         print(f"[PumpAlert] Could not resolve mint for signature {signature}", flush=True)
         return
@@ -313,8 +256,6 @@ def _handle_create_signature(signature):
             "alerted": False,
             "name": None,
             "symbol": None,
-            "bonding_curve_ata": bonding_curve_ata,
-            "last_holder_check_ts": 0.0,
         }
         watcher_status["tokens_tracking"] = len(tracked_tokens)
     print(f"[PumpAlert] New mint tracked: {mint}", flush=True)
@@ -420,57 +361,19 @@ def _poll_loop():
                 if not info:
                     continue
 
-                mcap = info["mcap"]
-
-                if mcap >= MAX_MARKET_CAP_USD:
-                    # Missed the window going up - drop it, no alert.
+                if info["mcap"] >= MIN_MARKET_CAP_USD:
                     with tracked_lock:
                         entry = tracked_tokens.get(mint)
-                        if entry and not entry["alerted"]:
-                            entry["alerted"] = True  # reuse flag to stop future checks/sweep it out
-                    continue
+                        if not entry or entry["alerted"]:
+                            continue
+                        entry["alerted"] = True
+                        watcher_status["alerts_sent"] += 1
 
-                if mcap < MIN_MARKET_CAP_USD:
-                    continue  # not in the window yet, keep polling
-
-                # In the [MIN, MAX) window - check holder concentration
-                # before alerting, but don't hammer RPC every 5s poll.
-                with tracked_lock:
-                    entry = tracked_tokens.get(mint)
-                    if not entry or entry["alerted"]:
-                        continue
-                    if now - entry["last_holder_check_ts"] < HOLDER_CHECK_COOLDOWN_SECONDS:
-                        continue
-                    entry["last_holder_check_ts"] = now
-                    bonding_curve_ata = entry.get("bonding_curve_ata")
-
-                top10_pct = get_top10_holder_pct(mint, bonding_curve_ata)
-
-                if top10_pct is None:
-                    print(f"[PumpAlert] {info['symbol']} ({mint}) holder check inconclusive, will retry", flush=True)
-                    continue
-
-                if top10_pct >= MAX_TOP10_HOLDER_PCT:
                     print(
-                        f"[PumpAlert] {info['symbol']} ({mint}) skipped - top10 holders {top10_pct:.1f}% "
-                        f"(>= {MAX_TOP10_HOLDER_PCT}%)",
+                        f"[PumpAlert] {info['symbol']} ({mint}) qualified - MC ${info['mcap']:,.0f}",
                         flush=True,
                     )
-                    continue  # stays tracked, will re-check next cooldown window
-
-                with tracked_lock:
-                    entry = tracked_tokens.get(mint)
-                    if not entry or entry["alerted"]:
-                        continue
-                    entry["alerted"] = True
-                    watcher_status["alerts_sent"] += 1
-
-                print(
-                    f"[PumpAlert] {info['symbol']} ({mint}) qualified - MC ${mcap:,.0f}, "
-                    f"top10 {top10_pct:.1f}%",
-                    flush=True,
-                )
-                send_telegram_alert(info["name"], info["symbol"], mint, mcap, top10_pct)
+                    send_telegram_alert(info["name"], info["symbol"], mint, info["mcap"])
 
         # Sweep stale/alerted entries out of the tracked dict.
         with tracked_lock:

@@ -18,6 +18,12 @@ services:
         sync: false
       - key: MIN_MARKET_CAP_USD
         value: "12000"
+      - key: MAX_MARKET_CAP_USD
+        value: "60000"
+      - key: MAX_TOP10_HOLDER_PCT
+        value: "60"
+      - key: HOLDER_CHECK_COOLDOWN_SECONDS
+        value: "15"
       - key: POLL_INTERVAL_SECONDS
         value: "5"
       - key: MAX_TRACK_AGE_SECONDS

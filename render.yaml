@@ -8,13 +8,21 @@ services:
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
-      - key: PUMPPORTAL_API_KEY
-        sync: false
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
+      # Set this and the RPC/WS URLs auto-build against Helius. Leave unset
+      # to fall back to the public (rate-limited) Solana RPC instead.
+      - key: HELIUS_API_KEY
+        sync: false
       - key: MIN_MARKET_CAP_USD
-        value: "11000"
-      - key: MIN_VOLUME_USD
-        value: "1000"
+        value: "12000"
+      - key: POLL_INTERVAL_SECONDS
+        value: "5"
+      - key: MAX_TRACK_AGE_SECONDS
+        value: "600"
+      - key: RPC_MIN_INTERVAL_SECONDS
+        value: "0.25"
+      - key: DEXSCREENER_MIN_INTERVAL_SECONDS
+        value: "0.25"

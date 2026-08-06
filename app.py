@@ -13,7 +13,7 @@ START_TIME = time.time()
 # Start the watcher once, when the module is first imported.
 # IMPORTANT: only run this process with a single worker (see render start
 # command) - each extra worker would spawn its own copy of the watcher and
-# send duplicate alerts (and double the metered PumpPortal usage).
+# send duplicate alerts (and multiply RPC/DexScreener request volume).
 _watcher_thread = threading.Thread(target=start_watcher_background, daemon=True)
 _watcher_thread.start()
 

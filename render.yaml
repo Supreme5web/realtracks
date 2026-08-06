@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: pumpfun-alert-bot
+    name: soltracker
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
@@ -8,13 +8,13 @@ services:
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
-      - key: PUMPPORTAL_API_KEY
+      - key: CODEX_API_KEY
         sync: false
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
-      - key: MIN_MARKET_CAP_USD
-        value: "11000"
-      - key: MIN_VOLUME_USD
-        value: "1000"
+      - key: DISCORD_WEBHOOK
+        sync: false
+      - key: WALLETS
+        sync: false

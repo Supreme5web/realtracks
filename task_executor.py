@@ -4,10 +4,10 @@ import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import click
 
-# Last processed transaction signature per tracked wallet, used with
-# getSignaturesForAddress's `until` param to fetch only new transactions
-# since the last poll.
-last_processed_signatures = {}
+# Timestamp (unix seconds) of the last swap event we've processed per tracked
+# wallet, used as the lower bound of the next Codex query window so we only
+# ever fetch new events since the last poll.
+last_processed_timestamp = {}
 
 # Weighted-average cost basis per (wallet, token), used to compute realized
 # PnL on sells. Lives only in memory - resets if the process restarts, so
@@ -16,12 +16,11 @@ last_processed_signatures = {}
 _cost_basis = {}
 _cost_basis_lock = threading.Lock()
 
-# Cached SOL/USD price, refreshed at most once every 60s so we don't hit
-# the price API on every single alert.
-_sol_price_cache = {"price": None, "ts": 0}
-_sol_price_lock = threading.Lock()
-SOL_PRICE_CACHE_TTL_SECONDS = 300  # 5 min - CoinGecko's free tier is IP-rate-limited and
-# Render's free-tier IPs are shared across many apps, so a short TTL just means more 429s.
+# How often each wallet's monitoring loop checks Codex for new swap events.
+# Much cheaper than the old QuickNode-polling design (one Codex query per
+# wallet per poll, typically, vs. a signatures call plus one getTransaction
+# call per signature), so this can run tighter than the old 30s interval.
+POLL_INTERVAL_SECONDS = 15
 
 
 def format_compact_number(value):
@@ -99,33 +98,6 @@ def escape_markdown(text):
     return text
 
 
-def get_sol_price_usd(codex_api_key):
-    """
-    Current SOL/USD price via Codex, using the wrapped-SOL mint as the "token" -
-    reuses the same provider/credentials already used for all other token
-    lookups, instead of depending on a separate free-tier price API (CoinGecko)
-    that kept hitting rate limits on Render's shared free-tier IPs.
-    Cached for SOL_PRICE_CACHE_TTL_SECONDS. Returns None only if the lookup
-    fails and there's no usable cached price yet.
-    """
-    now = time.time()
-    with _sol_price_lock:
-        if _sol_price_cache["price"] is not None and now - _sol_price_cache["ts"] < SOL_PRICE_CACHE_TTL_SECONDS:
-            return _sol_price_cache["price"]
-
-    token_info = get_token_info(WSOL_MINT, codex_api_key)
-    price = token_info.get("price_usd")
-    if price:
-        with _sol_price_lock:
-            _sol_price_cache["price"] = price
-            _sol_price_cache["ts"] = now
-        return price
-
-    click.echo("SOL price lookup failed (Codex returned no price for WSOL mint)")
-    with _sol_price_lock:
-        return _sol_price_cache["price"]  # may still be None, or a stale-but-usable value
-
-
 def record_buy(wallet_address, token_mint, units, cost_usd):
     """Add to the weighted-average cost basis for this wallet/token."""
     if units <= 0 or cost_usd is None:
@@ -193,15 +165,6 @@ def build_trading_bot_links_text(token_mint):
     return " | ".join(f"[{bot['label']}]({bot['build_url'](token_mint)})" for bot in TRADING_BOTS)
 
 
-# Mints that show up as intermediate routing hops in multi-hop swaps (e.g. a
-# Jupiter route that goes Token -> USDC -> Token) rather than as a token the
-# person actually chose to buy or sell. We never alert on these directly.
-IGNORED_MINTS = {
-    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
-    "So11111111111111111111111111111111111111112",  # Wrapped SOL
-}
-
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
 CODEX_GRAPHQL_URL = "https://graph.codex.io/graphql"
@@ -219,6 +182,38 @@ query GetTokenInfo($tokens: [String]) {
         symbol
       }
     }
+  }
+}
+"""
+
+# Fetches this wallet's swap events directly from Codex, already classified
+# as Buy/Sell with USD values computed - no separate raw-RPC fetch or
+# manual pre/post balance diffing needed. `timestamp` bounds the query to
+# only events since the last poll; ASC direction + cursor pagination lets us
+# walk forward through a busy window without missing anything.
+CODEX_MAKER_EVENTS_QUERY = """
+query GetMakerEvents($maker: String!, $from: Int!, $to: Int!, $cursor: String) {
+  getTokenEventsForMaker(
+    query: {maker: $maker, eventType: Swap, timestamp: {from: $from, to: $to}}
+    direction: ASC
+    limit: 200
+    cursor: $cursor
+  ) {
+    items {
+      eventDisplayType
+      timestamp
+      transactionHash
+      token0Address
+      token1Address
+      data {
+        ... on SwapEventData {
+          amount0
+          amount1
+          priceUsdTotal
+        }
+      }
+    }
+    cursor
   }
 }
 """
@@ -285,6 +280,54 @@ def get_token_info(token_mint, codex_api_key):
     except Exception as e:
         click.echo(f"Codex lookup failed for {token_mint}: {e}")
         return defaults
+
+
+def get_wallet_swap_events(wallet_address, from_ts, to_ts, codex_api_key, max_pages=25):
+    """
+    Fetch every Swap event for this wallet in [from_ts, to_ts] from Codex,
+    paginating with `cursor` until Codex reports no more pages. Raises on
+    any failure (missing key, HTTP error, GraphQL error) so the caller's
+    existing retry/backoff logic handles it the same way a failed RPC call
+    used to.
+    """
+    if not codex_api_key:
+        raise RuntimeError("CODEX_API_KEY not set")
+
+    events = []
+    cursor = None
+    for _ in range(max_pages):
+        resp = requests.post(
+            CODEX_GRAPHQL_URL,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": codex_api_key,
+            },
+            json={
+                "query": CODEX_MAKER_EVENTS_QUERY,
+                "variables": {"maker": wallet_address, "from": from_ts, "to": to_ts, "cursor": cursor},
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("errors"):
+            raise RuntimeError(f"Codex getTokenEventsForMaker error: {data['errors']}")
+
+        payload = (data.get("data") or {}).get("getTokenEventsForMaker") or {}
+        items = payload.get("items") or []
+        events.extend(items)
+
+        cursor = payload.get("cursor")
+        if not cursor or not items:
+            break
+    else:
+        click.echo(
+            f"[SolTracker] hit the {max_pages}-page cap fetching Codex swap events for "
+            f"{wallet_address} in window [{from_ts}, {to_ts}] - wallet may be extremely "
+            f"active this window"
+        )
+
+    return events
 
 
 def format_market_cap(value):
@@ -421,42 +464,20 @@ def send_discord_notification(webhook_url, wallet_name, wallet_address, action, 
 
 
 def notify(alerts_config, action, wallet_name, wallet_address, token_info, token_mint,
-           token_amount, sol_amount, codex_api_key, signature=None):
+           token_amount, sol_amount, sol_usd_value, signature=None):
     """
-    Compute USD value / holdings % / PnL for a buy or sell, update the cost-basis
-    tracker, and fan the alert out to whichever channels are configured.
+    Compute holdings % / PnL for a buy or sell, update the cost-basis tracker,
+    and fan the alert out to whichever channels are configured.
+
+    sol_usd_value is the swap's total USD value as computed by Codex itself
+    (SwapEventData.priceUsdTotal) - since Codex already prices the specific
+    swap at the time it happened, there's no need for a separate SOL/USD
+    price lookup or a cross-check against a second, independently-fetched
+    price the way the old QuickNode-based version needed.
     """
     telegram_bot_token = alerts_config.get("telegram_bot_token")
     telegram_chat_ids = alerts_config.get("telegram_chat_ids") or []
     discord_webhook = alerts_config.get("discord_webhook")
-
-    sol_price = get_sol_price_usd(codex_api_key)
-    # USD value of the token leg, shown next to the token amount in the alert.
-    try:
-        usd_value = token_amount * float(token_info.get("price_usd") or 0)
-    except (TypeError, ValueError):
-        usd_value = None
-    if not usd_value:
-        usd_value = None
-
-    # USD value of the SOL leg - what was actually paid/received - used for cost basis / PnL,
-    # since it reflects the real trade rather than a possibly-stale token price snapshot.
-    sol_usd_value = (sol_amount * sol_price) if sol_price is not None else None
-
-    # Sanity check: the token-price-derived USD value and the SOL-leg-derived USD value
-    # should roughly agree. When they don't, something is off (an off-chain price feed
-    # that's stale/wrong for a low-liquidity token, a bundled/multi-hop tx whose net SOL
-    # balance change doesn't equal the swap's gross value, etc.) - log it with the
-    # signature so a specific mismatched trade can actually be looked up on Solscan later,
-    # rather than only ever surfacing as an unexplained-looking number in the alert.
-    if usd_value and sol_usd_value and min(usd_value, sol_usd_value) > 0:
-        ratio = max(usd_value, sol_usd_value) / min(usd_value, sol_usd_value)
-        if ratio >= 3:
-            sig_note = f" sig={signature}" if signature else ""
-            click.echo(
-                f"[SolTracker] USD/SOL value mismatch for {wallet_name} ({token_mint}): "
-                f"token-price ${usd_value:,.2f} vs sol-leg ${sol_usd_value:,.2f}{sig_note}"
-            )
 
     pnl_usd = None
     pnl_pct = None
@@ -485,76 +506,129 @@ def notify(alerts_config, action, wallet_name, wallet_address, token_info, token
     if discord_webhook:
         send_discord_notification(
             discord_webhook, wallet_name, wallet_address, action, token_mint,
-            token_amount, sol_amount, usd_value, token_info["market_cap"], token_info["name"],
+            token_amount, sol_amount, sol_usd_value, token_info["market_cap"], token_info["name"],
             token_info["ticker"], pnl_usd, pnl_pct,
         )
 
 
-def rpc_call(quicknode_url, method, params, timeout=15):
-    """Call a Solana JSON-RPC method against the configured QuickNode endpoint."""
-    resp = requests.post(
-        quicknode_url,
-        json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-        timeout=timeout,
+def process_swap_event(wallet, event, codex_api_key, alerts_config):
+    """
+    Turn one Codex Swap event into a BUY/SELL alert. Codex has already done
+    the hard part (classifying Buy vs Sell, computing USD value) - this just
+    picks out the SOL leg vs the traded-token leg and fires the alert.
+
+    Only trades where one side of the pair is native/wrapped SOL are
+    considered "a trade" here, matching the original tool's scope (alerts
+    are always phrased as SOL spent/received). A token/token or
+    token/stablecoin pair swap is skipped, same as before.
+
+    Returns a short status string describing the outcome (for the caller to
+    aggregate into a per-poll summary) rather than logging directly.
+    """
+    wallet_address = wallet["address"]
+    wallet_name = wallet["name"]
+
+    token0 = event.get("token0Address")
+    token1 = event.get("token1Address")
+    data = event.get("data") or {}
+
+    if token0 == WSOL_MINT:
+        sol_leg_raw, token_leg_raw = data.get("amount0"), data.get("amount1")
+        token_mint = token1
+    elif token1 == WSOL_MINT:
+        sol_leg_raw, token_leg_raw = data.get("amount1"), data.get("amount0")
+        token_mint = token0
+    else:
+        return "non_sol_pair"
+
+    try:
+        sol_amount = abs(float(sol_leg_raw))
+        token_amount = abs(float(token_leg_raw))
+    except (TypeError, ValueError):
+        return "bad_amount"
+
+    if not sol_amount or not token_amount:
+        return "zero_amount"
+
+    display_type = event.get("eventDisplayType")
+    if display_type not in ("Buy", "Sell"):
+        return "unknown_direction"
+
+    try:
+        raw_usd_total = data.get("priceUsdTotal")
+        usd_value = abs(float(raw_usd_total)) if raw_usd_total is not None else None
+    except (TypeError, ValueError):
+        usd_value = None
+
+    token_info = get_token_info(token_mint, codex_api_key)
+    action = "BOUGHT" if display_type == "Buy" else "SOLD"
+    notify(
+        alerts_config, action, wallet_name, wallet_address, token_info, token_mint,
+        token_amount, sol_amount, usd_value, signature=event.get("transactionHash"),
     )
-    resp.raise_for_status()
-    data = resp.json()
-    if "error" in data:
-        raise RuntimeError(f"{method} RPC error: {data['error']}")
-    return data.get("result")
+    return "buy" if action == "BOUGHT" else "sell"
 
 
-def execute_monitoring(wallet, quicknode_url, codex_api_key, alerts_config):
+def execute_monitoring(wallet, codex_api_key, alerts_config):
     wallet_name = wallet["name"]
     wallet_address = wallet["address"]
 
-    if wallet_address not in last_processed_signatures:
-        last_processed_signatures[wallet_address] = None
+    if wallet_address not in last_processed_timestamp:
+        # First-ever poll for this wallet: start watching from "now" rather than
+        # pulling historical trades, so a deploy/restart doesn't re-alert on old
+        # activity that already happened before this process started.
+        last_processed_timestamp[wallet_address] = int(time.time())
+        click.echo(
+            f"[SolTracker] {wallet_name} ({wallet_address}): starting fresh, "
+            f"watching for new trades from now on"
+        )
 
     while True:
         try:
-            params = {"limit": 10}
-            last_sig = last_processed_signatures[wallet_address]
-            if last_sig:
-                params["until"] = last_sig
+            from_ts = last_processed_timestamp[wallet_address] + 1
+            to_ts = int(time.time())
 
-            sig_infos = rpc_call(quicknode_url, "getSignaturesForAddress", [wallet_address, params])
+            if from_ts > to_ts:
+                time.sleep(POLL_INTERVAL_SECONDS)
+                continue
 
-            if sig_infos:
-                # getSignaturesForAddress returns newest-first; process oldest-to-newest
-                # so alerts come out in chronological order.
-                sig_infos = list(reversed(sig_infos))
+            events = get_wallet_swap_events(wallet_address, from_ts, to_ts, codex_api_key)
+
+            if events:
                 click.echo(
-                    f"[SolTracker] {wallet_name} ({wallet_address}): found {len(sig_infos)} "
-                    f"new signature(s) this poll"
+                    f"[SolTracker] {wallet_name} ({wallet_address}): found {len(events)} "
+                    f"new swap event(s) this poll"
                 )
-                for info in sig_infos:
-                    if info.get("err") is not None:
-                        continue  # skip failed transactions
-
+                outcome_counts = {}
+                for event in events:
                     try:
-                        tx_result = rpc_call(
-                            quicknode_url,
-                            "getTransaction",
-                            [info["signature"], {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
-                        )
-                        if tx_result:
-                            process_transaction(wallet, tx_result, info["signature"], codex_api_key, alerts_config)
+                        outcome = process_swap_event(wallet, event, codex_api_key, alerts_config)
+                        if outcome in ("buy", "sell"):
+                            click.echo(
+                                f"[SolTracker] {wallet_name} - {event.get('transactionHash')}: "
+                                f"detected {'BUY' if outcome == 'buy' else 'SELL'}, sending alert"
+                            )
+                        outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
                     except Exception as e:
-                        # Don't let one bad/unparseable transaction abort the rest of the
-                        # batch - log it and move on. (last_processed_signatures still
-                        # advances below either way, so this signature won't be retried
-                        # forever and block newer trades from ever being seen.)
+                        # Don't let one bad/unparseable event abort the rest of the batch.
                         click.echo(
-                            f"[SolTracker] {wallet_name} - {info.get('signature')}: "
+                            f"[SolTracker] {wallet_name} - {event.get('transactionHash')}: "
                             f"failed to process: {e}"
                         )
+                        outcome_counts["exception"] = outcome_counts.get("exception", 0) + 1
 
-                last_processed_signatures[wallet_address] = sig_infos[-1]["signature"]
+                summary = ", ".join(f"{count} {label}" for label, count in sorted(outcome_counts.items()))
+                click.echo(f"[SolTracker] {wallet_name} ({wallet_address}): poll summary - {summary}")
+
+                # Advance to the newest event timestamp we actually saw, not to `to_ts`,
+                # so we never skip an event that landed after our query fired but shares
+                # `to_ts`'s second.
+                last_processed_timestamp[wallet_address] = max(e["timestamp"] for e in events)
             else:
                 click.echo(f"No new transactions for {wallet_name} ({wallet_address}).")
+                last_processed_timestamp[wallet_address] = to_ts
 
-            time.sleep(30)
+            time.sleep(POLL_INTERVAL_SECONDS)
         except requests.exceptions.RequestException as e:
             body = ""
             resp = getattr(e, "response", None)
@@ -563,124 +637,19 @@ def execute_monitoring(wallet, quicknode_url, codex_api_key, alerts_config):
                     body = f" | body: {resp.text[:300]}"
                 except Exception:
                     pass
-            click.echo(f"Error fetching transactions for {wallet_name} - {wallet_address}: {e}{body}")
+            click.echo(f"Error fetching events for {wallet_name} - {wallet_address}: {e}{body}")
             time.sleep(60)
         except Exception as e:
-            click.echo(f"Error processing transactions for {wallet_name} - {wallet_address}: {e}")
+            click.echo(f"Error processing events for {wallet_name} - {wallet_address}: {e}")
             time.sleep(60)
 
 
-def _account_index(tx_result, wallet_address):
-    """Find the wallet's index into preBalances/postBalances via the parsed accountKeys list."""
-    account_keys = tx_result["transaction"]["message"]["accountKeys"]
-    for i, key in enumerate(account_keys):
-        pubkey = key.get("pubkey") if isinstance(key, dict) else key
-        if pubkey == wallet_address:
-            return i
-    return None
-
-
-def _owned_mint_deltas(meta, wallet_address):
-    """
-    {mint: net_ui_amount_change} across all token accounts *owned by* wallet_address,
-    diffing preTokenBalances against postTokenBalances (matched by accountIndex).
-    An account absent from one side (e.g. a freshly-opened or fully-closed token
-    account) is treated as a balance of 0 on that side.
-    """
-    def _map(balances):
-        result = {}
-        for b in balances or []:
-            if b.get("owner") != wallet_address:
-                continue
-            ui = (b.get("uiTokenAmount") or {}).get("uiAmount")
-            mint = b.get("mint")
-            result[mint] = result.get(mint, 0.0) + (float(ui) if ui is not None else 0.0)
-        return result
-
-    pre_map = _map(meta.get("preTokenBalances"))
-    post_map = _map(meta.get("postTokenBalances"))
-    mints = set(pre_map) | set(post_map)
-    return {mint: post_map.get(mint, 0.0) - pre_map.get(mint, 0.0) for mint in mints}
-
-
-def process_transaction(wallet, tx_result, signature, codex_api_key, alerts_config):
-    """
-    Parse one getTransaction (jsonParsed) result and fire a BUY/SELL alert if
-    the wallet's own SOL and token balances moved in a way that looks like a
-    trade. Buy/sell direction and amounts come entirely from diffing
-    pre/post balances - no reliance on any pre-classified "type" field.
-    """
-    wallet_address = wallet["address"]
-    wallet_name = wallet["name"]
-
-    meta = tx_result.get("meta") or {}
-    if meta.get("err") is not None:
-        return  # failed transaction, nothing actually settled
-
-    wallet_index = _account_index(tx_result, wallet_address)
-    if wallet_index is None:
-        click.echo(
-            f"[SolTracker] {wallet_name} - {signature}: skipped, wallet not found in "
-            f"this tx's accountKeys (likely not the signer/fee-payer)"
-        )
-        return
-
-    # Native SOL leg: the wallet's own lamport balance before vs after. Note this
-    # includes the network/priority fee if the wallet is also the fee payer.
-    native_delta = 0.0
-    if wallet_index is not None and meta.get("preBalances") and meta.get("postBalances"):
-        native_delta = (meta["postBalances"][wallet_index] - meta["preBalances"][wallet_index]) / 1e9
-
-    mint_deltas = _owned_mint_deltas(meta, wallet_address)
-
-    # Wrapped SOL leg: some routes move SOL through the wallet's WSOL associated
-    # token account rather than as a plain native transfer, in which case
-    # native_delta alone would only reflect the fee.
-    wsol_delta = mint_deltas.get(WSOL_MINT, 0.0)
-    sol_amount = round(max(abs(native_delta), abs(wsol_delta)), 4)
-    if not sol_amount:
-        click.echo(
-            f"[SolTracker] {wallet_name} - {signature}: skipped, no net SOL/WSOL "
-            f"balance change detected (native_delta={native_delta}, wsol_delta={wsol_delta})"
-        )
-        return
-
-    # The traded token is whichever non-SOL/non-stable mint actually moved for
-    # this wallet. If more than one changed (e.g. a multi-hop route touching an
-    # intermediate token), we can't cleanly attribute a single trade, so skip
-    # rather than guess.
-    candidates = [
-        (mint, delta) for mint, delta in mint_deltas.items()
-        if mint not in IGNORED_MINTS and abs(delta) > 1e-9
-    ]
-    if len(candidates) != 1:
-        click.echo(
-            f"[SolTracker] {wallet_name} - {signature}: skipped, expected exactly 1 "
-            f"non-ignored token mint to move but found {len(candidates)} "
-            f"({[m for m, _ in candidates]})"
-        )
-        return
-    token_mint, token_delta = candidates[0]
-
-    token_amount = abs(token_delta)
-    token_info = get_token_info(token_mint, codex_api_key)
-
-    if token_delta > 0:
-        click.echo(f"[SolTracker] {wallet_name} - {signature}: detected BUY, sending alert")
-        notify(alerts_config, "BOUGHT", wallet_name, wallet_address, token_info,
-               token_mint, token_amount, sol_amount, codex_api_key, signature=signature)
-    elif token_delta < 0:
-        click.echo(f"[SolTracker] {wallet_name} - {signature}: detected SELL, sending alert")
-        notify(alerts_config, "SOLD", wallet_name, wallet_address, token_info,
-               token_mint, token_amount, sol_amount, codex_api_key, signature=signature)
-
-
-def run_tasks_concurrently(wallets, quicknode_url, codex_api_key, alerts_config):
+def run_tasks_concurrently(wallets, codex_api_key, alerts_config):
     """Run monitoring tasks concurrently for all wallets with a small delay between task starts."""
 
     def execute_with_delay(wallet):
         time.sleep(2)
-        execute_monitoring(wallet, quicknode_url, codex_api_key, alerts_config)
+        execute_monitoring(wallet, codex_api_key, alerts_config)
 
     # Each wallet's monitoring loop runs forever (it's a `while True`), so it holds
     # its worker thread for the lifetime of the process rather than returning it to

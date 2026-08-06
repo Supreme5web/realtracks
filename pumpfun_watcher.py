@@ -7,7 +7,6 @@ import threading
 
 import requests
 import websockets
-import base58
 
 # ---------------------------------------------------------------------------
 # Config (env vars)
@@ -62,6 +61,23 @@ CREATE_LOG_MARKER = "Program log: Instruction: Create"
 # This is what actually identifies pump.fun's own `create` instruction,
 # regardless of whether it's a top-level instruction or reached via CPI.
 CREATE_IX_DISCRIMINATOR = list(hashlib.sha256(b"global:create").digest()[:8])
+
+_B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_B58_INDEX = {c: i for i, c in enumerate(_B58_ALPHABET)}
+
+
+def b58decode(s):
+    """Minimal base58 decoder (Bitcoin/Solana alphabet) - avoids depending
+    on the external `base58` package, which isn't worth the risk of another
+    missed-dependency deploy failure for ~15 lines of code."""
+    if not s:
+        return b""
+    num = 0
+    for ch in s:
+        num = num * 58 + _B58_INDEX[ch]
+    combined = num.to_bytes((num.bit_length() + 7) // 8, "big") if num else b""
+    n_leading_zeros = len(s) - len(s.lstrip("1"))
+    return b"\x00" * n_leading_zeros + combined
 
 # ---------------------------------------------------------------------------
 # Shared state
@@ -129,7 +145,7 @@ def _is_create_ix(ix):
     if not data:
         return False
     try:
-        raw = base58.b58decode(data)
+        raw = b58decode(data)
     except Exception:
         return False
     return list(raw[:8]) == CREATE_IX_DISCRIMINATOR

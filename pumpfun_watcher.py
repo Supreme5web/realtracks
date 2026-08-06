@@ -12,18 +12,25 @@ import websockets
 # ---------------------------------------------------------------------------
 PUMP_FUN_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
-# Public RPC by default. Free public endpoints are heavily rate-limited and
-# sometimes drop long-lived websocket connections - swap in a free-tier
-# Helius/QuickNode/Shyft RPC+WS pair via env vars if you see frequent
-# reconnects or 429s.
-SOLANA_WS_URL = os.environ.get("SOLANA_WS_URL", "wss://api.mainnet-beta.solana.com")
-SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+# Prefer Helius if a key is provided - much higher rate limits and a far
+# more stable websocket than the public RPC. Falls back to public endpoints
+# (or explicit SOLANA_WS_URL/SOLANA_RPC_URL overrides) if no key is set.
+HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY", "")
+if HELIUS_API_KEY:
+    _default_ws = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+    _default_rpc = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+else:
+    _default_ws = "wss://api.mainnet-beta.solana.com"
+    _default_rpc = "https://api.mainnet-beta.solana.com"
+
+SOLANA_WS_URL = os.environ.get("SOLANA_WS_URL", _default_ws)
+SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", _default_rpc)
 
 MIN_MARKET_CAP_USD = float(os.environ.get("MIN_MARKET_CAP_USD", "12000"))
 POLL_INTERVAL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "5"))
 # How long we'll keep polling a mint for before giving up if it never hits
 # the mcap target (or never shows up on DexScreener at all).
-MAX_TRACK_AGE_SECONDS = float(os.environ.get("MAX_TRACK_AGE_SECONDS", "1800"))  # 30 min
+MAX_TRACK_AGE_SECONDS = float(os.environ.get("MAX_TRACK_AGE_SECONDS", "600"))  # 10 min
 
 # Throttling to stay under free-tier rate limits.
 RPC_MIN_INTERVAL_SECONDS = float(os.environ.get("RPC_MIN_INTERVAL_SECONDS", "0.25"))  # ~4 req/s

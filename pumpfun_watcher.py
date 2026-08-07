@@ -34,6 +34,8 @@ SOLANA_TRACKER_API_KEY = os.environ.get("SOLANA_TRACKER_API_KEY", "")
 SOLANA_TRACKER_BASE_URL = "https://data.solanatracker.io"
 
 MIN_MARKET_CAP_USD = float(os.environ.get("MIN_MARKET_CAP_USD", "12000"))
+# Minimum 24h volume (Solana Tracker) required to actually send the alert.
+MIN_ALERT_VOLUME_USD = float(os.environ.get("MIN_ALERT_VOLUME_USD", "14000"))
 POLL_INTERVAL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "5"))
 # How long we'll keep polling a mint for before giving up if it never hits
 # the mcap target (or never shows up on DexScreener at all).
@@ -275,6 +277,15 @@ def send_telegram_alert(name, symbol, mint, market_cap_usd):
             print(f"[PumpAlert] Skipping alert for {mint} - no socials found", flush=True)
             return
 
+        volume_usd = extra.get("volume_usd")
+        if volume_usd is not None and float(volume_usd) < MIN_ALERT_VOLUME_USD:
+            print(
+                f"[PumpAlert] Skipping alert for {mint} - volume ${float(volume_usd):,.0f} "
+                f"below ${MIN_ALERT_VOLUME_USD:,.0f} minimum",
+                flush=True,
+            )
+            return
+
     lines = [
         f"\U0001F680 *{name}* (${symbol})",
         f"*MC:* ${market_cap_usd:,.0f}",
@@ -380,8 +391,14 @@ async def _handle_logs_notification(msg, executor):
     loop.run_in_executor(executor, _handle_create_signature, signature)
 
 
+# Backoff schedule (seconds) used only after an HTTP 429 (rate limited)
+# websocket rejection: 1m, 2m, 4m, 8m, 15m max.
+RATE_LIMIT_BACKOFF_SCHEDULE = [60, 120, 240, 480, 900]
+
+
 async def _run_watcher_forever():
     backoff = 5
+    rate_limit_backoff_idx = 0
     executor = None
     import concurrent.futures
 
@@ -404,6 +421,7 @@ async def _run_watcher_forever():
                 watcher_status["connected"] = True
                 watcher_status["last_error"] = None
                 backoff = 5
+                rate_limit_backoff_idx = 0
                 print("[PumpAlert] Connected to Solana RPC websocket, subscribed to pump.fun logs", flush=True)
 
                 async for raw_message in ws:
@@ -417,6 +435,14 @@ async def _run_watcher_forever():
         except Exception as e:
             watcher_status["connected"] = False
             watcher_status["last_error"] = str(e)
+
+            if "429" in str(e):
+                wait = RATE_LIMIT_BACKOFF_SCHEDULE[min(rate_limit_backoff_idx, len(RATE_LIMIT_BACKOFF_SCHEDULE) - 1)]
+                rate_limit_backoff_idx += 1
+                print(f"[PumpAlert] Rate limited (429) - backing off {wait}s", flush=True)
+                await asyncio.sleep(wait)
+                continue
+
             print(f"[PumpAlert] Connection error: {e} - reconnecting in {backoff}s", flush=True)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)

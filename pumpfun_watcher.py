@@ -33,12 +33,6 @@ SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", _default_rpc)
 SOLANA_TRACKER_API_KEY = os.environ.get("SOLANA_TRACKER_API_KEY", "")
 SOLANA_TRACKER_BASE_URL = "https://data.solanatracker.io"
 
-# Optional - forwards each qualifying alert as a paper-trade signal to the
-# already-deployed demo trader bot. Leave DEMO_TRADER_URL unset to disable;
-# nothing about detection/alerting changes either way.
-DEMO_TRADER_URL = os.environ.get("DEMO_TRADER_URL", "").rstrip("/")
-DEMO_TRADER_SECRET = os.environ.get("DEMO_TRADER_SECRET", "")
-
 MIN_MARKET_CAP_USD = float(os.environ.get("MIN_MARKET_CAP_USD", "12000"))
 # Minimum 24h volume (Solana Tracker) required to actually send the alert.
 MIN_ALERT_VOLUME_USD = float(os.environ.get("MIN_ALERT_VOLUME_USD", "14000"))
@@ -265,32 +259,6 @@ def _format_price(price_usd):
     return f"${price_usd:,.4f}"
 
 
-def send_demo_trader_signal(mint, symbol, name, market_cap_usd, price_usd):
-    """Best-effort forward of a coin that already passed every existing
-    filter and just had its Telegram alert sent, to the demo trader bot.
-    Never raises and never blocks/affects the scanner - on any failure
-    (offline, timeout, non-2xx) it just logs and moves on."""
-    if not DEMO_TRADER_URL:
-        return
-    try:
-        resp = requests.post(
-            f"{DEMO_TRADER_URL}/signal",
-            json={
-                "mint": mint,
-                "symbol": symbol,
-                "name": name,
-                "market_cap": market_cap_usd,
-                "price_usd": price_usd,
-            },
-            headers={"X-Demo-Secret": DEMO_TRADER_SECRET},
-            timeout=5,
-        )
-        if resp.status_code >= 400:
-            print(f"[PumpAlert] Demo trader rejected signal for {mint}: {resp.status_code}", flush=True)
-    except Exception as e:
-        print(f"[PumpAlert] Demo trader signal failed for {mint}: {e}", flush=True)
-
-
 def send_telegram_alert(name, symbol, mint, market_cap_usd):
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_ids = [c.strip() for c in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if c.strip()]
@@ -371,8 +339,6 @@ def send_telegram_alert(name, symbol, mint, market_cap_usd):
             )
         except Exception as e:
             print(f"[PumpAlert] Telegram send failed for {chat_id}: {e}", flush=True)
-
-    send_demo_trader_signal(mint, symbol, name, market_cap_usd, extra.get("price_usd") if extra else None)
 
 
 # ---------------------------------------------------------------------------

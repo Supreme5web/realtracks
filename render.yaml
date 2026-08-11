@@ -31,3 +31,10 @@ services:
         value: "0.25"
       - key: DEXSCREENER_MIN_INTERVAL_SECONDS
         value: "0.25"
+      # Optional - persists /stats (daily call count + hitrate) in Supabase
+      # so it survives restarts/redeploys/idle spin-downs. Leave both unset
+      # to keep /stats in-memory only (resets on every restart).
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false

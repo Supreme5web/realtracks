@@ -87,13 +87,53 @@ _tracker_cache_lock = threading.Lock()
 TRACKER_CACHE_TTL = 300  # 5 minutes
 
 # /stats tracking - one bucket for "today" (UTC), reset automatically the
-# first time it's touched after midnight UTC.
+# first time it's touched after midnight UTC. This is the in-memory
+# fallback, used whenever Supabase isn't configured (see below) - it works
+# fine but resets on every restart/redeploy/idle spin-down.
 # mint -> {name, symbol, initial_mcap, hit_2x}
 daily_stats_lock = threading.Lock()
 daily_stats = {
     "date": datetime.now(STATS_DAY_TZ).date(),
     "called": {},
 }
+
+# Optional Supabase-backed persistence for /stats, so counts/hitrate survive
+# restarts, redeploys, and Render free-tier idle spin-downs (all of which
+# wipe plain in-memory state and even local disk, since Render's free
+# filesystem is ephemeral too). Set SUPABASE_URL + SUPABASE_KEY to enable;
+# leave unset and the bot falls back to the in-memory tracking above.
+#
+# Expected table (run once in the Supabase SQL editor):
+#
+#   create table pumpfun_calls (
+#     call_date date not null,
+#     mint text not null,
+#     name text,
+#     symbol text,
+#     initial_mcap numeric,
+#     hit_2x boolean not null default false,
+#     called_at timestamptz not null default now(),
+#     primary key (call_date, mint)
+#   );
+#
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+STATS_TABLE = os.environ.get("SUPABASE_STATS_TABLE", "pumpfun_calls")
+
+_supabase = None
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        from supabase import create_client
+        _supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print("[PumpAlert] /stats persistence: Supabase", flush=True)
+    except Exception as e:
+        print(f"[PumpAlert] Supabase init failed, falling back to in-memory /stats: {e}", flush=True)
+else:
+    print(
+        "[PumpAlert] /stats persistence: in-memory only "
+        "(set SUPABASE_URL/SUPABASE_KEY to persist across restarts)",
+        flush=True,
+    )
 
 
 def _throttle(lock, last_call, min_interval):
@@ -410,6 +450,25 @@ def _reset_if_new_day_unlocked():
 def _record_call(mint, name, symbol, mcap_usd):
     """Logs a coin as "called" for today's /stats count, right after an
     alert is actually sent (not just queued/considered)."""
+    today = datetime.now(STATS_DAY_TZ).date()
+
+    if _supabase is not None:
+        try:
+            _supabase.table(STATS_TABLE).upsert(
+                {
+                    "call_date": today.isoformat(),
+                    "mint": mint,
+                    "name": name,
+                    "symbol": symbol,
+                    "initial_mcap": mcap_usd,
+                    "hit_2x": False,
+                }
+            ).execute()
+            return
+        except Exception as e:
+            print(f"[PumpAlert] Supabase upsert failed for {mint}: {e}", flush=True)
+            # fall through to in-memory so we don't lose the record entirely
+
     with daily_stats_lock:
         _reset_if_new_day_unlocked()
         daily_stats["called"][mint] = {
@@ -421,16 +480,29 @@ def _record_call(mint, name, symbol, mcap_usd):
 
 
 def _format_stats_message():
-    with daily_stats_lock:
-        _reset_if_new_day_unlocked()
-        date_label = (
-            f"{daily_stats['date'].day}/"
-            f"{daily_stats['date'].strftime('%b').upper()}/"
-            f"{daily_stats['date'].year}"
-        )
-        total = len(daily_stats["called"])
-        hits = sum(1 for e in daily_stats["called"].values() if e["hit_2x"])
+    today = datetime.now(STATS_DAY_TZ).date()
 
+    if _supabase is not None:
+        try:
+            resp = (
+                _supabase.table(STATS_TABLE)
+                .select("hit_2x")
+                .eq("call_date", today.isoformat())
+                .execute()
+            )
+            rows = resp.data or []
+            total = len(rows)
+            hits = sum(1 for r in rows if r.get("hit_2x"))
+        except Exception as e:
+            print(f"[PumpAlert] Supabase read failed for /stats: {e}", flush=True)
+            total, hits = 0, 0
+    else:
+        with daily_stats_lock:
+            _reset_if_new_day_unlocked()
+            total = len(daily_stats["called"])
+            hits = sum(1 for e in daily_stats["called"].values() if e["hit_2x"])
+
+    date_label = f"{today.day}/{today.strftime('%b').upper()}/{today.year}"
     hitrate = (hits / total * 100) if total else 0
 
     return (
@@ -447,13 +519,31 @@ def _stats_tracking_loop():
     caring about a coin once the day rolls over (00:00 UTC), per design."""
     while True:
         time.sleep(STATS_TRACK_INTERVAL_SECONDS)
+        today = datetime.now(STATS_DAY_TZ).date()
 
-        with daily_stats_lock:
-            _reset_if_new_day_unlocked()
-            pending = [
-                mint for mint, e in daily_stats["called"].items() if not e["hit_2x"]
-            ]
+        if _supabase is not None:
+            try:
+                resp = (
+                    _supabase.table(STATS_TABLE)
+                    .select("mint,initial_mcap")
+                    .eq("call_date", today.isoformat())
+                    .eq("hit_2x", False)
+                    .execute()
+                )
+                pending_map = {r["mint"]: r["initial_mcap"] for r in (resp.data or [])}
+            except Exception as e:
+                print(f"[PumpAlert] Supabase read failed in stats tracking loop: {e}", flush=True)
+                continue
+        else:
+            with daily_stats_lock:
+                _reset_if_new_day_unlocked()
+                pending_map = {
+                    mint: e["initial_mcap"]
+                    for mint, e in daily_stats["called"].items()
+                    if not e["hit_2x"]
+                }
 
+        pending = list(pending_map.keys())
         if not pending:
             continue
 
@@ -461,22 +551,35 @@ def _stats_tracking_loop():
             batch = pending[i:i + DEXSCREENER_BATCH_SIZE]
             results = fetch_market_caps(batch)
 
-            with daily_stats_lock:
-                _reset_if_new_day_unlocked()  # day may have flipped mid-loop
-                for mint in batch:
-                    entry = daily_stats["called"].get(mint)
-                    if not entry or entry["hit_2x"]:
-                        continue
-                    info = results.get(mint)
-                    if not info:
-                        continue
-                    if info["mcap"] >= entry["initial_mcap"] * HITRATE_MULTIPLIER:
-                        entry["hit_2x"] = True
-                        print(
-                            f"[PumpAlert] {entry['symbol']} ({mint}) hit "
-                            f"{HITRATE_MULTIPLIER}x call mcap",
-                            flush=True,
-                        )
+            hit_mints = [
+                mint for mint in batch
+                if results.get(mint)
+                and results[mint]["mcap"] >= pending_map[mint] * HITRATE_MULTIPLIER
+            ]
+            if not hit_mints:
+                continue
+
+            if _supabase is not None:
+                for mint in hit_mints:
+                    try:
+                        _supabase.table(STATS_TABLE).update({"hit_2x": True}).eq(
+                            "call_date", today.isoformat()
+                        ).eq("mint", mint).execute()
+                    except Exception as e:
+                        print(f"[PumpAlert] Supabase update failed for {mint}: {e}", flush=True)
+            else:
+                with daily_stats_lock:
+                    _reset_if_new_day_unlocked()
+                    for mint in hit_mints:
+                        entry = daily_stats["called"].get(mint)
+                        if entry:
+                            entry["hit_2x"] = True
+
+            for mint in hit_mints:
+                print(
+                    f"[PumpAlert] {mint} hit {HITRATE_MULTIPLIER}x call mcap",
+                    flush=True,
+                )
 
 
 def _commands_loop():

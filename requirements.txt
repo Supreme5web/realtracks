@@ -1,6 +1,6 @@
 requests==2.32.3
 python-dotenv==1.0.1
-typing-extensions==4.12.2
+typing-extensions==4.15.0
 flask==3.1.0
 gunicorn==23.0.0
 websockets==13.1

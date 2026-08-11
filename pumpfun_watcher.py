@@ -1,4 +1,4 @@
-import os
+=import os
 import json
 import time
 import asyncio
@@ -260,6 +260,46 @@ def fetch_market_caps(mints):
                 "website": websites[0] if websites else None,
             }
     return out
+
+
+def fetch_pumpfun_metadata(mint):
+    """pump.fun's own (undocumented but widely used) coin endpoint - has
+    image_uri/twitter/telegram/website from the instant the token is
+    created, since it's the same data pump.fun's own site reads. Used as
+    a fallback/supplement when DexScreener hasn't indexed the pair's info
+    block yet (which, for a coin that just hit our mcap threshold, is
+    common - DexScreener's own indexing lags behind by anywhere from a
+    couple minutes to never for low-effort mints).
+    Returns {"image_url", "socials", "website"} or None on any failure."""
+    url = f"https://frontend-api-v3.pump.fun/coins/{mint}"
+    try:
+        resp = requests.get(
+            url,
+            timeout=8,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "Accept": "application/json",
+            },
+        )
+        if not resp.ok:
+            print(f"[PumpAlert] pump.fun metadata fetch for {mint} returned {resp.status_code}", flush=True)
+            return None
+        data = resp.json()
+    except Exception as e:
+        print(f"[PumpAlert] pump.fun metadata fetch failed for {mint}: {e}", flush=True)
+        return None
+
+    socials = {}
+    if data.get("twitter"):
+        socials["twitter"] = data["twitter"]
+    if data.get("telegram"):
+        socials["telegram"] = data["telegram"]
+
+    return {
+        "image_url": data.get("image_uri") or None,
+        "socials": socials,
+        "website": data.get("website") or None,
+    }
 
 
 def _crop_to_16_9(image_bytes):
@@ -791,15 +831,32 @@ def _poll_loop():
                         f"[PumpAlert] {info['symbol']} ({mint}) qualified - MC ${info['mcap']:,.0f}, Volume ${info.get('volume_usd', 0):,.0f}",
                         flush=True,
                     )
+
+                    image_url = info.get("image_url")
+                    socials = info.get("socials") or {}
+                    website = info.get("website")
+
+                    # DexScreener's info block (image/socials/website) is
+                    # frequently not indexed yet this early - fall back to
+                    # pump.fun's own API to fill in whatever's missing.
+                    if not image_url or not socials or not website:
+                        pf_meta = fetch_pumpfun_metadata(mint)
+                        if pf_meta:
+                            image_url = image_url or pf_meta.get("image_url")
+                            website = website or pf_meta.get("website")
+                            merged_socials = dict(pf_meta.get("socials") or {})
+                            merged_socials.update(socials)  # DexScreener wins on conflict
+                            socials = merged_socials
+
                     sent = send_telegram_alert(
                         info["name"], 
                         info["symbol"], 
                         mint, 
                         info["mcap"],
                         info.get("volume_usd"),
-                        info.get("image_url"),
-                        info.get("socials"),
-                        info.get("website"),
+                        image_url,
+                        socials,
+                        website,
                     )
                     # Only count/record it as a "call" if it actually went
                     # out - send_telegram_alert can still skip internally

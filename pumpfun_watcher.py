@@ -176,13 +176,12 @@ def fetch_market_caps(mints):
         # Prefer the first pair we see per mint; if a token has migrated to
         # Raydium it may have multiple pairs, but any one gives a usable mcap.
         if addr not in out:
-            # Get volume - try volume24h first, then volume
-            volume = pair.get("volume24h")
-            if volume is None:
-                volume = pair.get("volume")
-            # Handle case where volume is a dict
+            # DexScreener returns volume as a nested object keyed by
+            # timeframe: {"h24": ..., "h6": ..., "h1": ..., "m5": ...}.
+            # There is no top-level "volume24h" and no "usd"/"value" key.
+            volume = pair.get("volume")
             if isinstance(volume, dict):
-                volume = volume.get("usd") or volume.get("value")
+                volume = volume.get("h24")
             
             out[addr] = {
                 "mcap": float(mcap),

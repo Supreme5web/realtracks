@@ -377,14 +377,16 @@ def send_telegram_alert(name, symbol, mint, market_cap_usd, volume_usd):
             return False
 
     lines = [
-        f"{name} [{symbol}]",
-        f"Market Cap: ${market_cap_usd:,.0f}",
+        f"*{name}* [{symbol}]",
+        "",
+        f"\U0001F4B0 *Market Cap:* ${market_cap_usd:,.0f}",
     ]
 
     # Always show volume from DexScreener
     if volume_usd is not None:
-        lines.append(f"Volume: ${float(volume_usd):,.0f}")
+        lines.append(f"\U0001F4CA *Volume:* ${float(volume_usd):,.0f}")
 
+    lines.append("")
     lines.append(f"`{mint}`")
 
     if extra:

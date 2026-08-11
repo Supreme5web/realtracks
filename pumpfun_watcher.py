@@ -377,26 +377,18 @@ def send_telegram_alert(name, symbol, mint, market_cap_usd, volume_usd):
             return False
 
     lines = [
-        f"\U0001F680 *{name}* (${symbol})",
-        f"*MC:* ${market_cap_usd:,.0f}",
+        name,
+        f"`${symbol}`",
+        "",
+        f"\U0001F4B0 Market Cap: ${market_cap_usd:,.0f}",
     ]
-
-    if extra:
-        price_str = _format_price(extra.get("price_usd"))
-        if price_str:
-            lines.append(f"*Price:* {price_str}")
-
-        age_str = _format_age(extra.get("age_seconds"))
-        if age_str:
-            lines.append(f"*Age:* {age_str}")
-
-        buys, sells = extra.get("buys"), extra.get("sells")
-        if buys is not None and sells is not None:
-            lines.append(f"*Buys/Sells:* {buys}/{sells}")
 
     # Always show volume from DexScreener
     if volume_usd is not None:
-        lines.append(f"*Volume:* ${float(volume_usd):,.0f}")
+        lines.append(f"\U0001F4CA Volume: ${float(volume_usd):,.0f}")
+
+    lines.append("")
+    lines.append(f"`{mint}`")
 
     if extra:
         socials = []
@@ -409,13 +401,13 @@ def send_telegram_alert(name, symbol, mint, market_cap_usd, volume_usd):
         if socials:
             lines.append(" | ".join(socials))
 
-    lines.append(f"*CA:* `{mint}`")
-    lines.append(
-        f"[DexScreener](https://dexscreener.com/solana/{mint}) | "
-        f"[pump.fun](https://pump.fun/{mint})"
-    )
-
     text = "\n".join(lines)
+
+    reply_markup = {
+        "inline_keyboard": [
+            [{"text": "Check Live Chart", "url": f"https://dexscreener.com/solana/{mint}"}]
+        ]
+    }
 
     for chat_id in chat_ids:
         try:
@@ -426,6 +418,7 @@ def send_telegram_alert(name, symbol, mint, market_cap_usd, volume_usd):
                     "text": text,
                     "parse_mode": "Markdown",
                     "disable_web_page_preview": True,
+                    "reply_markup": reply_markup,
                 },
                 timeout=10,
             )

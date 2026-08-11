@@ -3,10 +3,16 @@ import json
 import time
 import asyncio
 import threading
+from io import BytesIO
 from datetime import datetime, timezone
 
 import requests
 import websockets
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 
 # ---------------------------------------------------------------------------
 # Config (env vars)
@@ -26,13 +32,6 @@ else:
 
 SOLANA_WS_URL = os.environ.get("SOLANA_WS_URL", _default_ws)
 SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", _default_rpc)
-
-# Used only for enriching the outgoing alert (buys/sells, volume, age,
-# price, socials) - never touches detection/tracking. Sign up at
-# solanatracker.io for a key. If unset, alerts just fall back to the
-# original name/CA/MC-only format.
-SOLANA_TRACKER_API_KEY = os.environ.get("SOLANA_TRACKER_API_KEY", "")
-SOLANA_TRACKER_BASE_URL = "https://data.solanatracker.io"
 
 MIN_MARKET_CAP_USD = float(os.environ.get("MIN_MARKET_CAP_USD", "12000"))
 # Minimum 24h volume (from DexScreener) required to actually send the alert.
@@ -80,11 +79,6 @@ _rpc_lock = threading.Lock()
 
 _dex_last_call = {"ts": 0.0}
 _dex_lock = threading.Lock()
-
-# Cache for Solana Tracker results to reduce API calls
-_tracker_cache = {}
-_tracker_cache_lock = threading.Lock()
-TRACKER_CACHE_TTL = 300  # 5 minutes
 
 # /stats tracking - one bucket for "today" (UTC), reset automatically the
 # first time it's touched after midnight UTC. This is the in-memory
@@ -203,7 +197,7 @@ def get_mint_from_signature(signature, retries=4, delay=1.0):
 
 
 def fetch_market_caps(mints):
-    """Batch-query DexScreener for a list of mints, return {mint: {mcap, name, symbol, price_usd, volume_usd}}.
+    """Batch-query DexScreener for a list of mints, return {mint: {mcap, name, symbol, price_usd, volume_usd, image_url}}.
     Returns an empty dict (never raises) on failure - callers just retry next poll cycle."""
     if not mints:
         return {}
@@ -247,102 +241,42 @@ def fetch_market_caps(mints):
                 "symbol": base.get("symbol") or "N/A",
                 "price_usd": pair.get("priceUsd"),
                 "volume_usd": float(volume) if volume is not None else None,
+                "image_url": (pair.get("info") or {}).get("imageUrl"),
             }
     return out
 
 
-def fetch_solana_tracker_info(mint):
-    """Best-effort lookup of buys/sells, age, and socials for
-    a mint via the Solana Tracker API. Called once, at alert time - never
-    part of the detection/polling loop. Returns None on any failure (missing
-    key, timeout, bad response, etc) so a slow/broken lookup never blocks
-    the core alert from going out."""
-    
-    # Check cache first
-    with _tracker_cache_lock:
-        cached = _tracker_cache.get(mint)
-        if cached and (time.time() - cached["ts"]) < TRACKER_CACHE_TTL:
-            return cached["data"]
-    
-    if not SOLANA_TRACKER_API_KEY:
+def _crop_to_16_9(image_bytes):
+    """Center-crops raw image bytes to a 16:9 aspect ratio and returns JPEG
+    bytes. Returns None on any failure (corrupt image, unsupported format,
+    Pillow not installed, etc) so a bad image never blocks the alert."""
+    if Image is None:
         return None
-    
     try:
-        resp = requests.get(
-            f"{SOLANA_TRACKER_BASE_URL}/tokens/{mint}",
-            headers={"x-api-key": SOLANA_TRACKER_API_KEY},
-            timeout=8,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        img = Image.open(BytesIO(image_bytes))
+        img = img.convert("RGB")
+        w, h = img.size
+        target_ratio = 16 / 9
+        current_ratio = w / h
+
+        if current_ratio > target_ratio:
+            new_w = int(h * target_ratio)
+            left = (w - new_w) // 2
+            img = img.crop((left, 0, left + new_w, h))
+        else:
+            new_h = int(w / target_ratio)
+            top = (h - new_h) // 2
+            img = img.crop((0, top, w, top + new_h))
+
+        out = BytesIO()
+        img.save(out, format="JPEG", quality=90)
+        return out.getvalue()
     except Exception as e:
-        print(f"[PumpAlert] Solana Tracker fetch failed for {mint}: {e}", flush=True)
+        print(f"[PumpAlert] Image crop failed: {e}", flush=True)
         return None
 
-    token_info = data.get("token") or {}
-    pools = data.get("pools") or []
-    pool = pools[0] if pools else {}
-    txns = pool.get("txns") or {}
-    price = pool.get("price") or {}
 
-    age_seconds = None
-    created_at = pool.get("createdAt")
-    if created_at:
-        try:
-            age_seconds = max(0, time.time() - (float(created_at) / 1000))
-        except (TypeError, ValueError):
-            age_seconds = None
-
-    result = {
-        "buys": txns.get("buys"),
-        "sells": txns.get("sells"),
-        "volume_usd": None,  # We use DexScreener for volume now
-        "price_usd": price.get("usd"),
-        "age_seconds": age_seconds,
-        "twitter": token_info.get("twitter"),
-        "telegram": token_info.get("telegram"),
-        "website": token_info.get("website"),
-    }
-    
-    # Cache the result
-    with _tracker_cache_lock:
-        _tracker_cache[mint] = {
-            "data": result,
-            "ts": time.time()
-        }
-    
-    return result
-
-
-def _format_age(age_seconds):
-    if age_seconds is None:
-        return None
-    age_seconds = int(age_seconds)
-    if age_seconds < 60:
-        return f"{age_seconds}s"
-    minutes = age_seconds // 60
-    if minutes < 60:
-        return f"{minutes}m"
-    hours, minutes = divmod(minutes, 60)
-    if hours < 24:
-        return f"{hours}h {minutes}m"
-    days, hours = divmod(hours, 24)
-    return f"{days}d {hours}h"
-
-
-def _format_price(price_usd):
-    if price_usd is None:
-        return None
-    try:
-        price_usd = float(price_usd)
-    except (TypeError, ValueError):
-        return None
-    if price_usd < 0.01:
-        return f"${price_usd:.8f}".rstrip("0").rstrip(".")
-    return f"${price_usd:,.4f}"
-
-
-def send_telegram_alert(name, symbol, mint, market_cap_usd, volume_usd):
+def send_telegram_alert(name, symbol, mint, market_cap_usd, volume_usd, image_url=None):
     """Returns True if the alert was actually sent (used to log the call
     for /stats), False if it was skipped for any reason."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -359,22 +293,21 @@ def send_telegram_alert(name, symbol, mint, market_cap_usd, volume_usd):
             flush=True,
         )
         return False
-    
+
+    # Skip if mcap has outrun volume - i.e. price is up on thin trading,
+    # not real activity.
+    if volume_usd is not None and market_cap_usd > float(volume_usd):
+        print(
+            f"[PumpAlert] Skipping alert for {mint} - mcap ${market_cap_usd:,.0f} "
+            f"> volume ${float(volume_usd):,.0f}",
+            flush=True,
+        )
+        return False
+
     # If volume is None (shouldn't happen with DexScreener), skip to avoid spam
     if volume_usd is None:
         print(f"[PumpAlert] Skipping {mint} - volume data unavailable", flush=True)
         return False
-
-    extra = fetch_solana_tracker_info(mint)
-
-    # Skip coins with no socials at all. If the lookup itself failed (no API
-    # key, timeout, bad response) we can't know either way, so we fail open
-    # and still send the alert rather than silently dropping it.
-    if extra is not None:
-        has_socials = bool(extra.get("twitter") or extra.get("telegram") or extra.get("website"))
-        if not has_socials:
-            print(f"[PumpAlert] Skipping alert for {mint} - no socials found", flush=True)
-            return False
 
     lines = [
         f"*{name}* [{symbol}]",
@@ -389,17 +322,6 @@ def send_telegram_alert(name, symbol, mint, market_cap_usd, volume_usd):
     lines.append("")
     lines.append(f"`{mint}`")
 
-    if extra:
-        socials = []
-        if extra.get("twitter"):
-            socials.append(f"[Twitter]({extra['twitter']})")
-        if extra.get("telegram"):
-            socials.append(f"[Telegram]({extra['telegram']})")
-        if extra.get("website"):
-            socials.append(f"[Website]({extra['website']})")
-        if socials:
-            lines.append(" | ".join(socials))
-
     text = "\n".join(lines)
 
     reply_markup = {
@@ -408,19 +330,43 @@ def send_telegram_alert(name, symbol, mint, market_cap_usd, volume_usd):
         ]
     }
 
+    # Fetch + center-crop the token image to 16:9. Best-effort - any failure
+    # here just falls back to a text-only alert rather than blocking it.
+    photo_bytes = None
+    if image_url:
+        try:
+            img_resp = requests.get(image_url, timeout=10)
+            img_resp.raise_for_status()
+            photo_bytes = _crop_to_16_9(img_resp.content)
+        except Exception as e:
+            print(f"[PumpAlert] Failed to fetch token image for {mint}: {e}", flush=True)
+
     for chat_id in chat_ids:
         try:
-            requests.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={
-                    "chat_id": chat_id,
-                    "text": text,
-                    "parse_mode": "Markdown",
-                    "disable_web_page_preview": True,
-                    "reply_markup": reply_markup,
-                },
-                timeout=10,
-            )
+            if photo_bytes:
+                requests.post(
+                    f"https://api.telegram.org/bot{token}/sendPhoto",
+                    data={
+                        "chat_id": chat_id,
+                        "caption": text,
+                        "parse_mode": "Markdown",
+                        "reply_markup": json.dumps(reply_markup),
+                    },
+                    files={"photo": ("token.jpg", photo_bytes, "image/jpeg")},
+                    timeout=15,
+                )
+            else:
+                requests.post(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    json={
+                        "chat_id": chat_id,
+                        "text": text,
+                        "parse_mode": "Markdown",
+                        "disable_web_page_preview": True,
+                        "reply_markup": reply_markup,
+                    },
+                    timeout=10,
+                )
         except Exception as e:
             print(f"[PumpAlert] Telegram send failed for {chat_id}: {e}", flush=True)
 
@@ -785,7 +731,8 @@ def _poll_loop():
                         info["symbol"], 
                         mint, 
                         info["mcap"],
-                        info.get("volume_usd")
+                        info.get("volume_usd"),
+                        info.get("image_url"),
                     )
                     # Only count/record it as a "call" if it actually went
                     # out - send_telegram_alert can still skip internally

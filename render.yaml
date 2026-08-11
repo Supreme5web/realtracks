@@ -16,11 +16,6 @@ services:
       # to fall back to the public (rate-limited) Solana RPC instead.
       - key: HELIUS_API_KEY
         sync: false
-      # Optional - powers the extra alert fields (buys/sells, volume, age,
-      # price, socials). Get a key at solanatracker.io. Leave unset and
-      # alerts just fall back to the original name/CA/MC-only format.
-      - key: SOLANA_TRACKER_API_KEY
-        sync: false
       - key: MIN_MARKET_CAP_USD
         value: "12000"
       - key: POLL_INTERVAL_SECONDS

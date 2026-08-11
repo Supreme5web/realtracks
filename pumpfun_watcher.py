@@ -34,7 +34,7 @@ SOLANA_TRACKER_API_KEY = os.environ.get("SOLANA_TRACKER_API_KEY", "")
 SOLANA_TRACKER_BASE_URL = "https://data.solanatracker.io"
 
 MIN_MARKET_CAP_USD = float(os.environ.get("MIN_MARKET_CAP_USD", "12000"))
-# Minimum 24h volume (Solana Tracker) required to actually send the alert.
+# Minimum 24h volume (from DexScreener) required to actually send the alert.
 MIN_ALERT_VOLUME_USD = float(os.environ.get("MIN_ALERT_VOLUME_USD", "14000"))
 POLL_INTERVAL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "5"))
 # How long we'll keep polling a mint for before giving up if it never hits
@@ -54,7 +54,7 @@ CREATE_LOG_MARKER = "Program log: Instruction: Create"
 # ---------------------------------------------------------------------------
 # Shared state
 # ---------------------------------------------------------------------------
-# mint -> {created_ts, alerted, name, symbol, misses}
+# mint -> {created_ts, alerted, name, symbol, misses, volume_usd}
 tracked_tokens = {}
 tracked_lock = threading.Lock()
 
@@ -71,6 +71,11 @@ _rpc_lock = threading.Lock()
 
 _dex_last_call = {"ts": 0.0}
 _dex_lock = threading.Lock()
+
+# Cache for Solana Tracker results to reduce API calls
+_tracker_cache = {}
+_tracker_cache_lock = threading.Lock()
+TRACKER_CACHE_TTL = 300  # 5 minutes
 
 
 def _throttle(lock, last_call, min_interval):
@@ -140,7 +145,7 @@ def get_mint_from_signature(signature, retries=4, delay=1.0):
 
 
 def fetch_market_caps(mints):
-    """Batch-query DexScreener for a list of mints, return {mint: {mcap, name, symbol, price_usd}}.
+    """Batch-query DexScreener for a list of mints, return {mint: {mcap, name, symbol, price_usd, volume_usd}}.
     Returns an empty dict (never raises) on failure - callers just retry next poll cycle."""
     if not mints:
         return {}
@@ -171,23 +176,40 @@ def fetch_market_caps(mints):
         # Prefer the first pair we see per mint; if a token has migrated to
         # Raydium it may have multiple pairs, but any one gives a usable mcap.
         if addr not in out:
+            # Get volume - try volume24h first, then volume
+            volume = pair.get("volume24h")
+            if volume is None:
+                volume = pair.get("volume")
+            # Handle case where volume is a dict
+            if isinstance(volume, dict):
+                volume = volume.get("usd") or volume.get("value")
+            
             out[addr] = {
                 "mcap": float(mcap),
                 "name": base.get("name") or "Unknown",
                 "symbol": base.get("symbol") or "N/A",
                 "price_usd": pair.get("priceUsd"),
+                "volume_usd": float(volume) if volume is not None else None,
             }
     return out
 
 
 def fetch_solana_tracker_info(mint):
-    """Best-effort lookup of buys/sells, volume, age, price, and socials for
+    """Best-effort lookup of buys/sells, age, and socials for
     a mint via the Solana Tracker API. Called once, at alert time - never
     part of the detection/polling loop. Returns None on any failure (missing
     key, timeout, bad response, etc) so a slow/broken lookup never blocks
     the core alert from going out."""
+    
+    # Check cache first
+    with _tracker_cache_lock:
+        cached = _tracker_cache.get(mint)
+        if cached and (time.time() - cached["ts"]) < TRACKER_CACHE_TTL:
+            return cached["data"]
+    
     if not SOLANA_TRACKER_API_KEY:
         return None
+    
     try:
         resp = requests.get(
             f"{SOLANA_TRACKER_BASE_URL}/tokens/{mint}",
@@ -206,11 +228,6 @@ def fetch_solana_tracker_info(mint):
     txns = pool.get("txns") or {}
     price = pool.get("price") or {}
 
-    volume_usd = txns.get("volume24h")
-    if volume_usd is None:
-        vol = txns.get("volume")
-        volume_usd = vol.get("usd") if isinstance(vol, dict) else vol
-
     age_seconds = None
     created_at = pool.get("createdAt")
     if created_at:
@@ -219,16 +236,25 @@ def fetch_solana_tracker_info(mint):
         except (TypeError, ValueError):
             age_seconds = None
 
-    return {
+    result = {
         "buys": txns.get("buys"),
         "sells": txns.get("sells"),
-        "volume_usd": volume_usd,
+        "volume_usd": None,  # We use DexScreener for volume now
         "price_usd": price.get("usd"),
         "age_seconds": age_seconds,
         "twitter": token_info.get("twitter"),
         "telegram": token_info.get("telegram"),
         "website": token_info.get("website"),
     }
+    
+    # Cache the result
+    with _tracker_cache_lock:
+        _tracker_cache[mint] = {
+            "data": result,
+            "ts": time.time()
+        }
+    
+    return result
 
 
 def _format_age(age_seconds):
@@ -259,11 +285,25 @@ def _format_price(price_usd):
     return f"${price_usd:,.4f}"
 
 
-def send_telegram_alert(name, symbol, mint, market_cap_usd):
+def send_telegram_alert(name, symbol, mint, market_cap_usd, volume_usd):
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_ids = [c.strip() for c in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if c.strip()]
     if not token or not chat_ids:
         print("[PumpAlert] Can't send alert - TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set", flush=True)
+        return
+
+    # Volume filter - using DexScreener data we already have
+    if volume_usd is not None and float(volume_usd) < MIN_ALERT_VOLUME_USD:
+        print(
+            f"[PumpAlert] Skipping alert for {mint} - volume ${float(volume_usd):,.0f} "
+            f"below ${MIN_ALERT_VOLUME_USD:,.0f} minimum",
+            flush=True,
+        )
+        return
+    
+    # If volume is None (shouldn't happen with DexScreener), skip to avoid spam
+    if volume_usd is None:
+        print(f"[PumpAlert] Skipping {mint} - volume data unavailable", flush=True)
         return
 
     extra = fetch_solana_tracker_info(mint)
@@ -275,15 +315,6 @@ def send_telegram_alert(name, symbol, mint, market_cap_usd):
         has_socials = bool(extra.get("twitter") or extra.get("telegram") or extra.get("website"))
         if not has_socials:
             print(f"[PumpAlert] Skipping alert for {mint} - no socials found", flush=True)
-            return
-
-        volume_usd = extra.get("volume_usd")
-        if volume_usd is not None and float(volume_usd) < MIN_ALERT_VOLUME_USD:
-            print(
-                f"[PumpAlert] Skipping alert for {mint} - volume ${float(volume_usd):,.0f} "
-                f"below ${MIN_ALERT_VOLUME_USD:,.0f} minimum",
-                flush=True,
-            )
             return
 
     lines = [
@@ -304,9 +335,11 @@ def send_telegram_alert(name, symbol, mint, market_cap_usd):
         if buys is not None and sells is not None:
             lines.append(f"*Buys/Sells:* {buys}/{sells}")
 
-        if extra.get("volume_usd") is not None:
-            lines.append(f"*Volume:* ${float(extra['volume_usd']):,.0f}")
+    # Always show volume from DexScreener
+    if volume_usd is not None:
+        lines.append(f"*Volume:* ${float(volume_usd):,.0f}")
 
+    if extra:
         socials = []
         if extra.get("twitter"):
             socials.append(f"[Twitter]({extra['twitter']})")
@@ -362,6 +395,7 @@ def _handle_create_signature(signature):
             "alerted": False,
             "name": None,
             "symbol": None,
+            "volume_usd": None,
         }
         watcher_status["tokens_tracking"] = len(tracked_tokens)
     print(f"[PumpAlert] New mint tracked: {mint}", flush=True)
@@ -478,10 +512,12 @@ def _poll_loop():
                     if info:
                         entry["name"] = info["name"]
                         entry["symbol"] = info["symbol"]
+                        entry["volume_usd"] = info.get("volume_usd")
 
                 if not info:
                     continue
 
+                # Check market cap threshold
                 if info["mcap"] >= MIN_MARKET_CAP_USD:
                     with tracked_lock:
                         entry = tracked_tokens.get(mint)
@@ -491,10 +527,16 @@ def _poll_loop():
                         watcher_status["alerts_sent"] += 1
 
                     print(
-                        f"[PumpAlert] {info['symbol']} ({mint}) qualified - MC ${info['mcap']:,.0f}",
+                        f"[PumpAlert] {info['symbol']} ({mint}) qualified - MC ${info['mcap']:,.0f}, Volume ${info.get('volume_usd', 0):,.0f}",
                         flush=True,
                     )
-                    send_telegram_alert(info["name"], info["symbol"], mint, info["mcap"])
+                    send_telegram_alert(
+                        info["name"], 
+                        info["symbol"], 
+                        mint, 
+                        info["mcap"],
+                        info.get("volume_usd")
+                    )
 
         # Sweep stale/alerted entries out of the tracked dict.
         with tracked_lock:

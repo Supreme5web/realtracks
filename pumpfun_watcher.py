@@ -234,14 +234,30 @@ def fetch_market_caps(mints):
             volume = pair.get("volume")
             if isinstance(volume, dict):
                 volume = volume.get("h24")
-            
+
+            info = pair.get("info") or {}
+
+            # info.socials items are {"platform": "twitter", "handle": "..."}
+            # per DexScreener's actual schema (NOT "type"/"url" - that was
+            # wrong in an earlier version of this code). In practice
+            # "handle" is the full profile URL, not a bare username.
+            socials = {}
+            for s in info.get("socials") or []:
+                s_platform = (s.get("platform") or "").lower()
+                s_handle = s.get("handle")
+                if s_platform and s_handle and s_platform not in socials:
+                    socials[s_platform] = s_handle
+            websites = [w.get("url") for w in (info.get("websites") or []) if w.get("url")]
+
             out[addr] = {
                 "mcap": float(mcap),
                 "name": base.get("name") or "Unknown",
                 "symbol": base.get("symbol") or "N/A",
                 "price_usd": pair.get("priceUsd"),
                 "volume_usd": float(volume) if volume is not None else None,
-                "image_url": (pair.get("info") or {}).get("imageUrl"),
+                "image_url": info.get("imageUrl"),
+                "socials": socials,
+                "website": websites[0] if websites else None,
             }
     return out
 
@@ -276,7 +292,31 @@ def _crop_to_16_9(image_bytes):
         return None
 
 
-def send_telegram_alert(name, symbol, mint, market_cap_usd, volume_usd, image_url=None):
+SOCIAL_BUTTON_LABELS = {
+    "twitter": "\U0001F426 Twitter/X",
+    "x": "\U0001F426 Twitter/X",
+    "telegram": "\u2708\ufe0f Telegram",
+    "discord": "\U0001F3AE Discord",
+}
+
+
+def _build_reply_markup(mint, socials, website):
+    """Chart button always first, then one button per available social link,
+    then the website if present. Telegram allows multiple inline_keyboard
+    rows/buttons so this just grows as more links are available."""
+    row = [{"text": "Check Live Chart", "url": f"https://dexscreener.com/solana/{mint}"}]
+    seen_labels = set()
+    for s_type, label in SOCIAL_BUTTON_LABELS.items():
+        url = (socials or {}).get(s_type)
+        if url and label not in seen_labels:
+            row.append({"text": label, "url": url})
+            seen_labels.add(label)
+    if website:
+        row.append({"text": "\U0001F310 Website", "url": website})
+    return {"inline_keyboard": [row]}
+
+
+def send_telegram_alert(name, symbol, mint, market_cap_usd, volume_usd, image_url=None, socials=None, website=None):
     """Returns True if the alert was actually sent (used to log the call
     for /stats), False if it was skipped for any reason."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -324,27 +364,40 @@ def send_telegram_alert(name, symbol, mint, market_cap_usd, volume_usd, image_ur
 
     text = "\n".join(lines)
 
-    reply_markup = {
-        "inline_keyboard": [
-            [{"text": "Check Live Chart", "url": f"https://dexscreener.com/solana/{mint}"}]
-        ]
-    }
+    reply_markup = _build_reply_markup(mint, socials, website)
 
     # Fetch + center-crop the token image to 16:9. Best-effort - any failure
-    # here just falls back to a text-only alert rather than blocking it.
+    # here just falls back to a text-only alert rather than blocking it, but
+    # we log *why* every time so a persistent failure is diagnosable from
+    # the Render logs instead of just silently never sending photos.
     photo_bytes = None
-    if image_url:
+    if not image_url:
+        print(f"[PumpAlert] No image_url from DexScreener for {mint} - sending text-only", flush=True)
+    else:
         try:
-            img_resp = requests.get(image_url, timeout=10)
+            # dd.dexscreener.com (DexScreener's image CDN) commonly 403s
+            # requests that don't look like a browser - a bare User-Agent
+            # header is enough to get past that.
+            img_resp = requests.get(
+                image_url,
+                timeout=10,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            )
             img_resp.raise_for_status()
             photo_bytes = _crop_to_16_9(img_resp.content)
+            if photo_bytes is None:
+                print(
+                    f"[PumpAlert] Image fetched for {mint} but crop failed "
+                    f"(Pillow available: {Image is not None}) - sending text-only",
+                    flush=True,
+                )
         except Exception as e:
-            print(f"[PumpAlert] Failed to fetch token image for {mint}: {e}", flush=True)
+            print(f"[PumpAlert] Failed to fetch token image for {mint} from {image_url}: {e}", flush=True)
 
     for chat_id in chat_ids:
         try:
             if photo_bytes:
-                requests.post(
+                resp = requests.post(
                     f"https://api.telegram.org/bot{token}/sendPhoto",
                     data={
                         "chat_id": chat_id,
@@ -355,8 +408,14 @@ def send_telegram_alert(name, symbol, mint, market_cap_usd, volume_usd, image_ur
                     files={"photo": ("token.jpg", photo_bytes, "image/jpeg")},
                     timeout=15,
                 )
+                if not resp.ok:
+                    print(
+                        f"[PumpAlert] Telegram sendPhoto failed for {chat_id} "
+                        f"({resp.status_code}): {resp.text[:300]}",
+                        flush=True,
+                    )
             else:
-                requests.post(
+                resp = requests.post(
                     f"https://api.telegram.org/bot{token}/sendMessage",
                     json={
                         "chat_id": chat_id,
@@ -367,6 +426,12 @@ def send_telegram_alert(name, symbol, mint, market_cap_usd, volume_usd, image_ur
                     },
                     timeout=10,
                 )
+                if not resp.ok:
+                    print(
+                        f"[PumpAlert] Telegram sendMessage failed for {chat_id} "
+                        f"({resp.status_code}): {resp.text[:300]}",
+                        flush=True,
+                    )
         except Exception as e:
             print(f"[PumpAlert] Telegram send failed for {chat_id}: {e}", flush=True)
 
@@ -733,6 +798,8 @@ def _poll_loop():
                         info["mcap"],
                         info.get("volume_usd"),
                         info.get("image_url"),
+                        info.get("socials"),
+                        info.get("website"),
                     )
                     # Only count/record it as a "call" if it actually went
                     # out - send_telegram_alert can still skip internally

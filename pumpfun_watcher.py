@@ -3,6 +3,7 @@ import json
 import time
 import asyncio
 import threading
+from datetime import datetime, timezone
 
 import requests
 import websockets
@@ -46,6 +47,14 @@ RPC_MIN_INTERVAL_SECONDS = float(os.environ.get("RPC_MIN_INTERVAL_SECONDS", "0.2
 DEXSCREENER_MIN_INTERVAL_SECONDS = float(os.environ.get("DEXSCREENER_MIN_INTERVAL_SECONDS", "0.25"))
 DEXSCREENER_BATCH_SIZE = 30  # DexScreener's /tokens/ endpoint accepts up to 30 comma-separated addresses
 
+# --- /stats config -----------------------------------------------------
+# How often we re-check called coins' mcap to see if they've hit 2x their
+# call mcap yet. Separate (slower) interval from the detection poll loop
+# since this can run for up to ~24h per coin and doesn't need to be fast.
+STATS_TRACK_INTERVAL_SECONDS = float(os.environ.get("STATS_TRACK_INTERVAL_SECONDS", "30"))
+HITRATE_MULTIPLIER = 2.0  # a "hit" = mcap reached >= 2x the mcap at call time
+STATS_DAY_TZ = timezone.utc  # the day boundary for /stats resets at 00:00 UTC
+
 # Log line Anchor emits for the pump.fun "create" instruction. logsSubscribe
 # is already filtered to txs that mention the program, so this line is what
 # actually distinguishes "new mint" from every buy/sell/other tx on it.
@@ -76,6 +85,15 @@ _dex_lock = threading.Lock()
 _tracker_cache = {}
 _tracker_cache_lock = threading.Lock()
 TRACKER_CACHE_TTL = 300  # 5 minutes
+
+# /stats tracking - one bucket for "today" (UTC), reset automatically the
+# first time it's touched after midnight UTC.
+# mint -> {name, symbol, initial_mcap, hit_2x}
+daily_stats_lock = threading.Lock()
+daily_stats = {
+    "date": datetime.now(STATS_DAY_TZ).date(),
+    "called": {},
+}
 
 
 def _throttle(lock, last_call, min_interval):
@@ -285,11 +303,13 @@ def _format_price(price_usd):
 
 
 def send_telegram_alert(name, symbol, mint, market_cap_usd, volume_usd):
+    """Returns True if the alert was actually sent (used to log the call
+    for /stats), False if it was skipped for any reason."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_ids = [c.strip() for c in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if c.strip()]
     if not token or not chat_ids:
         print("[PumpAlert] Can't send alert - TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set", flush=True)
-        return
+        return False
 
     # Volume filter - using DexScreener data we already have
     if volume_usd is not None and float(volume_usd) < MIN_ALERT_VOLUME_USD:
@@ -298,12 +318,12 @@ def send_telegram_alert(name, symbol, mint, market_cap_usd, volume_usd):
             f"below ${MIN_ALERT_VOLUME_USD:,.0f} minimum",
             flush=True,
         )
-        return
+        return False
     
     # If volume is None (shouldn't happen with DexScreener), skip to avoid spam
     if volume_usd is None:
         print(f"[PumpAlert] Skipping {mint} - volume data unavailable", flush=True)
-        return
+        return False
 
     extra = fetch_solana_tracker_info(mint)
 
@@ -314,7 +334,7 @@ def send_telegram_alert(name, symbol, mint, market_cap_usd, volume_usd):
         has_socials = bool(extra.get("twitter") or extra.get("telegram") or extra.get("website"))
         if not has_socials:
             print(f"[PumpAlert] Skipping alert for {mint} - no socials found", flush=True)
-            return
+            return False
 
     lines = [
         f"\U0001F680 *{name}* (${symbol})",
@@ -371,6 +391,143 @@ def send_telegram_alert(name, symbol, mint, market_cap_usd, volume_usd):
             )
         except Exception as e:
             print(f"[PumpAlert] Telegram send failed for {chat_id}: {e}", flush=True)
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# /stats - daily call count + hitrate (>= 2x call mcap before day resets)
+# ---------------------------------------------------------------------------
+
+def _reset_if_new_day_unlocked():
+    """Must be called while holding daily_stats_lock."""
+    today = datetime.now(STATS_DAY_TZ).date()
+    if daily_stats["date"] != today:
+        daily_stats["date"] = today
+        daily_stats["called"] = {}
+
+
+def _record_call(mint, name, symbol, mcap_usd):
+    """Logs a coin as "called" for today's /stats count, right after an
+    alert is actually sent (not just queued/considered)."""
+    with daily_stats_lock:
+        _reset_if_new_day_unlocked()
+        daily_stats["called"][mint] = {
+            "name": name,
+            "symbol": symbol,
+            "initial_mcap": mcap_usd,
+            "hit_2x": False,
+        }
+
+
+def _format_stats_message():
+    with daily_stats_lock:
+        _reset_if_new_day_unlocked()
+        date_label = (
+            f"{daily_stats['date'].day}/"
+            f"{daily_stats['date'].strftime('%b').upper()}/"
+            f"{daily_stats['date'].year}"
+        )
+        total = len(daily_stats["called"])
+        hits = sum(1 for e in daily_stats["called"].values() if e["hit_2x"])
+
+    hitrate = (hits / total * 100) if total else 0
+
+    return (
+        f"COINS CALLED {date_label}\n\n"
+        f"{total} COINS\n\n"
+        f"Hitrate: {hitrate:.0f}%"
+    )
+
+
+def _stats_tracking_loop():
+    """Runs independently of the detection poll loop. Periodically re-checks
+    every not-yet-2x'd coin called today against DexScreener and marks it a
+    hit once its mcap reaches HITRATE_MULTIPLIER x its call-time mcap. Stops
+    caring about a coin once the day rolls over (00:00 UTC), per design."""
+    while True:
+        time.sleep(STATS_TRACK_INTERVAL_SECONDS)
+
+        with daily_stats_lock:
+            _reset_if_new_day_unlocked()
+            pending = [
+                mint for mint, e in daily_stats["called"].items() if not e["hit_2x"]
+            ]
+
+        if not pending:
+            continue
+
+        for i in range(0, len(pending), DEXSCREENER_BATCH_SIZE):
+            batch = pending[i:i + DEXSCREENER_BATCH_SIZE]
+            results = fetch_market_caps(batch)
+
+            with daily_stats_lock:
+                _reset_if_new_day_unlocked()  # day may have flipped mid-loop
+                for mint in batch:
+                    entry = daily_stats["called"].get(mint)
+                    if not entry or entry["hit_2x"]:
+                        continue
+                    info = results.get(mint)
+                    if not info:
+                        continue
+                    if info["mcap"] >= entry["initial_mcap"] * HITRATE_MULTIPLIER:
+                        entry["hit_2x"] = True
+                        print(
+                            f"[PumpAlert] {entry['symbol']} ({mint}) hit "
+                            f"{HITRATE_MULTIPLIER}x call mcap",
+                            flush=True,
+                        )
+
+
+def _commands_loop():
+    """Long-polls Telegram getUpdates for incoming commands (currently just
+    /stats) and replies in the chat it was sent from. Only responds to chats
+    listed in TELEGRAM_CHAT_ID, so randoms can't probe a public bot."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    allowed_chat_ids = {
+        c.strip() for c in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if c.strip()
+    }
+    if not token or not allowed_chat_ids:
+        return  # nothing to do without credentials - alerts loop already logs this
+
+    offset = None
+    while True:
+        try:
+            params = {"timeout": 30}
+            if offset is not None:
+                params["offset"] = offset
+            resp = requests.get(
+                f"https://api.telegram.org/bot{token}/getUpdates",
+                params=params,
+                timeout=35,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            print(f"[PumpAlert] getUpdates failed: {e}", flush=True)
+            time.sleep(5)
+            continue
+
+        for update in data.get("result", []):
+            offset = update["update_id"] + 1
+            message = update.get("message") or update.get("channel_post") or {}
+            text = (message.get("text") or "").strip()
+            chat_id = (message.get("chat") or {}).get("id")
+            if not chat_id or not text:
+                continue
+            if str(chat_id) not in allowed_chat_ids:
+                continue
+
+            command = text.split()[0].split("@")[0].lower()
+            if command == "/stats":
+                try:
+                    requests.post(
+                        f"https://api.telegram.org/bot{token}/sendMessage",
+                        json={"chat_id": chat_id, "text": _format_stats_message()},
+                        timeout=10,
+                    )
+                except Exception as e:
+                    print(f"[PumpAlert] Failed to send /stats reply: {e}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -523,19 +680,24 @@ def _poll_loop():
                         if not entry or entry["alerted"]:
                             continue
                         entry["alerted"] = True
-                        watcher_status["alerts_sent"] += 1
 
                     print(
                         f"[PumpAlert] {info['symbol']} ({mint}) qualified - MC ${info['mcap']:,.0f}, Volume ${info.get('volume_usd', 0):,.0f}",
                         flush=True,
                     )
-                    send_telegram_alert(
+                    sent = send_telegram_alert(
                         info["name"], 
                         info["symbol"], 
                         mint, 
                         info["mcap"],
                         info.get("volume_usd")
                     )
+                    # Only count/record it as a "call" if it actually went
+                    # out - send_telegram_alert can still skip internally
+                    # (volume/socials filters) even after the mcap gate.
+                    if sent:
+                        watcher_status["alerts_sent"] += 1
+                        _record_call(mint, info["name"], info["symbol"], info["mcap"])
 
         # Sweep stale/alerted entries out of the tracked dict.
         with tracked_lock:
@@ -550,9 +712,12 @@ def _poll_loop():
 # ---------------------------------------------------------------------------
 
 def start_watcher_background():
-    """Starts the mcap poll loop in its own thread, then runs the websocket
+    """Starts the mcap poll loop, /stats 2x-tracking loop, and the Telegram
+    command listener each in their own thread, then runs the websocket
     listener forever on this thread."""
     threading.Thread(target=_poll_loop, daemon=True).start()
+    threading.Thread(target=_stats_tracking_loop, daemon=True).start()
+    threading.Thread(target=_commands_loop, daemon=True).start()
     try:
         asyncio.run(_run_watcher_forever())
     except Exception as e:

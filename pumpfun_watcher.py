@@ -4,7 +4,7 @@ import time
 import asyncio
 import threading
 from io import BytesIO
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 import websockets
@@ -62,6 +62,12 @@ DEXSCREENER_BATCH_SIZE = 30  # DexScreener's /tokens/ endpoint accepts up to 30 
 STATS_TRACK_INTERVAL_SECONDS = float(os.environ.get("STATS_TRACK_INTERVAL_SECONDS", "30"))
 HITRATE_MULTIPLIER = 2.0  # a "hit" = mcap reached >= 2x the mcap at call time
 STATS_DAY_TZ = timezone.utc  # the day boundary for /stats resets at 00:00 UTC
+
+# /stats timeframe selector - the inline keyboard shown under /stats lets
+# the user flip between these rolling windows (hours). Default matches the
+# original behavior (24h).
+STATS_TIMEFRAME_OPTIONS_HOURS = [1, 4, 6, 12, 24]
+STATS_DEFAULT_TIMEFRAME_HOURS = 24
 
 # Log line Anchor emits for the pump.fun "create" instruction. logsSubscribe
 # is already filtered to txs that mention the program, so this line is what
@@ -587,6 +593,7 @@ def _record_call(mint, name, symbol, mcap_usd):
             "symbol": symbol,
             "initial_mcap": mcap_usd,
             "ath_mcap": mcap_usd,
+            "called_at": time.time(),
         }
 
 
@@ -632,15 +639,40 @@ def _format_recent_message():
     return "\n".join(lines)
 
 
-def _format_stats_message():
-    today = datetime.now(STATS_DAY_TZ).date()
+# Plain numbered emojis (1..10) used for the /stats top-10 list, so it
+# reads as a straightforward ranked list rather than a podium.
+NUMBER_EMOJIS = [
+    "1\uFE0F\u20E3", "2\uFE0F\u20E3", "3\uFE0F\u20E3", "4\uFE0F\u20E3", "5\uFE0F\u20E3",
+    "6\uFE0F\u20E3", "7\uFE0F\u20E3", "8\uFE0F\u20E3", "9\uFE0F\u20E3", "\U0001F51F",
+]
+
+
+def _build_stats_keyboard(selected_hours):
+    """Inline keyboard of timeframe buttons shown under /stats. The
+    currently-selected window gets a checkmark so it's obvious which one
+    is active; tapping another posts a `stats_tf:<hours>` callback that
+    _commands_loop uses to re-render the same message in place."""
+    row = []
+    for hours in STATS_TIMEFRAME_OPTIONS_HOURS:
+        label = f"{hours}H"
+        if hours == selected_hours:
+            label = f"\u2705 {label}"
+        row.append({"text": label, "callback_data": f"stats_tf:{hours}"})
+    return {"inline_keyboard": [row]}
+
+
+def _format_stats_message(hours=STATS_DEFAULT_TIMEFRAME_HOURS):
+    """Builds the /stats text for a rolling `hours`-wide window (1/4/6/12/24h,
+    selected via the inline keyboard). Total calls, hitrate, and the top-10
+    list are all scoped to that window."""
+    cutoff_dt = datetime.now(timezone.utc) - timedelta(hours=hours)
 
     if _supabase is not None:
         try:
             resp = (
                 _supabase.table(STATS_TABLE)
-                .select("name,symbol,initial_mcap,ath_mcap")
-                .eq("call_date", today.isoformat())
+                .select("name,symbol,initial_mcap,ath_mcap,called_at")
+                .gte("called_at", cutoff_dt.isoformat())
                 .execute()
             )
             rows = resp.data or []
@@ -648,9 +680,18 @@ def _format_stats_message():
             print(f"[PumpAlert] Supabase read failed for /stats: {e}", flush=True)
             rows = []
     else:
+        # In-memory fallback only ever holds "today" (it's cleared at
+        # 00:00 UTC - see _reset_if_new_day_unlocked), so a window request
+        # that reaches back across the day boundary just won't see calls
+        # from before the reset. Acceptable trade-off for the no-Supabase
+        # fallback; Supabase mode above isn't affected by this.
+        cutoff_ts = time.time() - hours * 3600
         with daily_stats_lock:
             _reset_if_new_day_unlocked()
-            rows = list(daily_stats["called"].values())
+            rows = [
+                r for r in daily_stats["called"].values()
+                if (r.get("called_at") or 0) >= cutoff_ts
+            ]
 
     total = len(rows)
 
@@ -666,10 +707,10 @@ def _format_stats_message():
     hits = sum(1 for mult, _ in multiples if mult >= HITRATE_MULTIPLIER)
     hitrate = (hits / total * 100) if total else 0
 
-    date_label = f"{today.day}/{today.strftime('%b').upper()}/{today.year}"
+    window_label = f"Last {hours}H"
 
     lines = [
-        f"\U0001F4CA *COINS CALLED* \u2014 {date_label}",
+        f"\U0001F4CA *COINS CALLED* \u2014 {window_label}",
         "\u2500" * 18,
         f"\U0001F3AF *Total Calls:*  {total}",
         f"\u2705 *Hitrate (\u2265{HITRATE_MULTIPLIER:g}x):*  {hitrate:.0f}%",
@@ -679,16 +720,10 @@ def _format_stats_message():
     if top10:
         lines.append("\u2500" * 18)
         lines.append("\U0001F3C6 *Top 10 by ATH*")
-        medals = [
-            "\U0001F947", "\U0001F948", "\U0001F949",
-            "4\uFE0F\u20E3", "5\uFE0F\u20E3", "6\uFE0F\u20E3",
-            "7\uFE0F\u20E3", "8\uFE0F\u20E3", "9\uFE0F\u20E3",
-            "\U0001F51F",
-        ]
-        for medal, (mult, r) in zip(medals, top10):
+        for number_emoji, (mult, r) in zip(NUMBER_EMOJIS, top10):
             name = _escape_md(r.get("name") or "Unknown")
             symbol = _escape_md(r.get("symbol") or "N/A")
-            lines.append(f"{medal} {name} [{symbol}] \u2014 *{mult:.1f}x*")
+            lines.append(f"{number_emoji} {name} [{symbol}] \u2014 *{mult:.1f}x*")
 
     return "\n".join(lines)
 
@@ -763,8 +798,9 @@ def _stats_tracking_loop():
 
 def _commands_loop():
     """Long-polls Telegram getUpdates for incoming commands (/stats and
-    /recent) and replies in the chat it was sent from. Only responds to
-    chats listed in TELEGRAM_CHAT_ID, so randoms can't probe a public bot."""
+    /recent) plus the /stats timeframe-button taps (callback queries), and
+    replies in the chat it was sent from. Only responds to chats listed in
+    TELEGRAM_CHAT_ID, so randoms can't probe a public bot."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     allowed_chat_ids = {
         c.strip() for c in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if c.strip()
@@ -792,6 +828,12 @@ def _commands_loop():
 
         for update in data.get("result", []):
             offset = update["update_id"] + 1
+
+            callback_query = update.get("callback_query")
+            if callback_query:
+                _handle_stats_callback(token, callback_query, allowed_chat_ids)
+                continue
+
             message = update.get("message") or update.get("channel_post") or {}
             text = (message.get("text") or "").strip()
             chat_id = (message.get("chat") or {}).get("id")
@@ -801,8 +843,29 @@ def _commands_loop():
                 continue
 
             command = text.split()[0].split("@")[0].lower()
-            if command in ("/stats", "/recent"):
-                reply_text = _format_stats_message() if command == "/stats" else _format_recent_message()
+            if command == "/stats":
+                reply_text = _format_stats_message(STATS_DEFAULT_TIMEFRAME_HOURS)
+                try:
+                    resp = requests.post(
+                        f"https://api.telegram.org/bot{token}/sendMessage",
+                        json={
+                            "chat_id": chat_id,
+                            "text": reply_text,
+                            "parse_mode": "Markdown",
+                            "reply_markup": _build_stats_keyboard(STATS_DEFAULT_TIMEFRAME_HOURS),
+                        },
+                        timeout=10,
+                    )
+                    if not resp.ok:
+                        print(
+                            f"[PumpAlert] /stats sendMessage failed for {chat_id} "
+                            f"({resp.status_code}): {resp.text[:300]}",
+                            flush=True,
+                        )
+                except Exception as e:
+                    print(f"[PumpAlert] Failed to send /stats reply: {e}", flush=True)
+            elif command == "/recent":
+                reply_text = _format_recent_message()
                 try:
                     resp = requests.post(
                         f"https://api.telegram.org/bot{token}/sendMessage",
@@ -815,12 +878,83 @@ def _commands_loop():
                     )
                     if not resp.ok:
                         print(
-                            f"[PumpAlert] {command} sendMessage failed for {chat_id} "
+                            f"[PumpAlert] /recent sendMessage failed for {chat_id} "
                             f"({resp.status_code}): {resp.text[:300]}",
                             flush=True,
                         )
                 except Exception as e:
-                    print(f"[PumpAlert] Failed to send {command} reply: {e}", flush=True)
+                    print(f"[PumpAlert] Failed to send /recent reply: {e}", flush=True)
+
+
+def _handle_stats_callback(token, callback_query, allowed_chat_ids):
+    """Handles a tap on one of the /stats timeframe buttons: re-renders the
+    same message in place with the new window's data, swaps the checkmark
+    to the newly-selected button, and acks the tap so Telegram stops
+    showing the button's loading spinner."""
+    callback_id = callback_query.get("id")
+    data = callback_query.get("data") or ""
+    message = callback_query.get("message") or {}
+    chat_id = (message.get("chat") or {}).get("id")
+    message_id = message.get("message_id")
+
+    if not data.startswith("stats_tf:") or not chat_id or not message_id:
+        # Not a button we recognize / stale message - still ack it so the
+        # tap doesn't spin forever on the user's end.
+        if callback_id:
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{token}/answerCallbackQuery",
+                    json={"callback_query_id": callback_id},
+                    timeout=10,
+                )
+            except Exception:
+                pass
+        return
+
+    if str(chat_id) not in allowed_chat_ids:
+        return
+
+    try:
+        hours = int(data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        hours = STATS_DEFAULT_TIMEFRAME_HOURS
+    if hours not in STATS_TIMEFRAME_OPTIONS_HOURS:
+        hours = STATS_DEFAULT_TIMEFRAME_HOURS
+
+    reply_text = _format_stats_message(hours)
+
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{token}/editMessageText",
+            json={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": reply_text,
+                "parse_mode": "Markdown",
+                "reply_markup": _build_stats_keyboard(hours),
+            },
+            timeout=10,
+        )
+        if not resp.ok and "message is not modified" not in resp.text:
+            # Telegram 400s harmlessly if the tapped button was already the
+            # active one (text/markup unchanged) - not worth logging.
+            print(
+                f"[PumpAlert] stats_tf editMessageText failed for {chat_id} "
+                f"({resp.status_code}): {resp.text[:300]}",
+                flush=True,
+            )
+    except Exception as e:
+        print(f"[PumpAlert] Failed to edit /stats message for {chat_id}: {e}", flush=True)
+
+    if callback_id:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{token}/answerCallbackQuery",
+                json={"callback_query_id": callback_id},
+                timeout=10,
+            )
+        except Exception as e:
+            print(f"[PumpAlert] answerCallbackQuery failed: {e}", flush=True)
 
 
 # ---------------------------------------------------------------------------

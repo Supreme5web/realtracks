@@ -363,20 +363,14 @@ SOCIAL_BUTTON_LABELS = {
 }
 
 
-def _build_reply_markup(mint, socials, website):
-    """Chart button always first, then one button per available social link,
-    then the website if present. Telegram allows multiple inline_keyboard
-    rows/buttons so this just grows as more links are available."""
-    row = [{"text": "Check Live Chart", "url": f"https://dexscreener.com/solana/{mint}"}]
-    seen_labels = set()
-    for s_type, label in SOCIAL_BUTTON_LABELS.items():
-        url = (socials or {}).get(s_type)
-        if url and label not in seen_labels:
-            row.append({"text": label, "url": url})
-            seen_labels.add(label)
-    if website:
-        row.append({"text": "\U0001F310 Website", "url": website})
-    return {"inline_keyboard": [row]}
+def _build_reply_markup(mint):
+    """Just the chart button now - socials/website are plain text links in
+    the message itself instead of buttons."""
+    return {
+        "inline_keyboard": [
+            [{"text": "Check Live Chart", "url": f"https://dexscreener.com/solana/{mint}"}]
+        ]
+    }
 
 
 def send_telegram_alert(name, symbol, mint, market_cap_usd, volume_usd, image_url=None, socials=None, website=None):
@@ -422,12 +416,35 @@ def send_telegram_alert(name, symbol, mint, market_cap_usd, volume_usd, image_ur
     if volume_usd is not None:
         lines.append(f"\U0001F4CA *Volume:* ${float(volume_usd):,.0f}")
 
+    # Socials/website as embedded (clickable) Markdown links rather than
+    # raw pasted URLs or buttons.
+    social_lines = []
+    for s_type, label in SOCIAL_BUTTON_LABELS.items():
+        url = (socials or {}).get(s_type)
+        if url:
+            social_lines.append(f"[{label}]({url})")
+    if website:
+        social_lines.append(f"[\U0001F310 Website]({website})")
+
+    # SOCIAL_BUTTON_LABELS has both "twitter" and "x" mapped to the same
+    # label - dedupe so the same link doesn't show up twice.
+    seen = set()
+    deduped_social_lines = []
+    for line in social_lines:
+        if line not in seen:
+            deduped_social_lines.append(line)
+            seen.add(line)
+
+    if deduped_social_lines:
+        lines.append("")
+        lines.extend(deduped_social_lines)
+
     lines.append("")
     lines.append(f"`{mint}`")
 
     text = "\n".join(lines)
 
-    reply_markup = _build_reply_markup(mint, socials, website)
+    reply_markup = _build_reply_markup(mint)
 
     # Fetch + center-crop the token image to 16:9. Best-effort - any failure
     # here just falls back to a text-only alert rather than blocking it, but

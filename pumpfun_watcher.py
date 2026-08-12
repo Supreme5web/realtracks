@@ -163,11 +163,30 @@ def rpc_call(method, params, max_retries=4):
     return None
 
 
+def _find_pumpfun_mint_in_instructions(instructions):
+    """Scans a flat list of parsed instructions for one invoking the pump.fun
+    program and returns its first account (the mint), or None."""
+    for ix in instructions or []:
+        if ix.get("programId") == PUMP_FUN_PROGRAM_ID:
+            accounts = ix.get("accounts")
+            if accounts:
+                return accounts[0]
+    return None
+
+
 def get_mint_from_signature(signature, retries=4, delay=1.0):
     """Fetch the tx behind a create-log signature and pull the mint address
-    out of it. The pump.fun `create` instruction's account order (per its
-    Anchor IDL) puts the new mint at index 0. Retries a few times since the
-    tx isn't always fetchable the instant we get the log notification.
+    out of it. The pump.fun `create`/`create_v2` instruction's account order
+    (per its Anchor IDL) puts the new mint at index 0. Retries a few times
+    since the tx isn't always fetchable the instant we get the log
+    notification.
+
+    Checks BOTH the transaction's top-level instructions AND its inner
+    instructions (meta.innerInstructions) - a growing share of creates go
+    through sniper/bundler tools that CPI into the pump.fun program from
+    their own top-level instruction, in which case the pump.fun call only
+    shows up nested inside innerInstructions. Missing this silently drops
+    exactly the fast/competitive launches most likely to actually pump.
     """
     for attempt in range(retries):
         result = rpc_call(
@@ -183,12 +202,16 @@ def get_mint_from_signature(signature, retries=4, delay=1.0):
         )
         if result:
             try:
-                instructions = result["transaction"]["message"]["instructions"]
-                for ix in instructions:
-                    if ix.get("programId") == PUMP_FUN_PROGRAM_ID:
-                        accounts = ix.get("accounts")
-                        if accounts:
-                            return accounts[0]
+                top_level = result["transaction"]["message"]["instructions"]
+                mint = _find_pumpfun_mint_in_instructions(top_level)
+                if mint:
+                    return mint
+
+                inner_groups = (result.get("meta") or {}).get("innerInstructions") or []
+                for group in inner_groups:
+                    mint = _find_pumpfun_mint_in_instructions(group.get("instructions"))
+                    if mint:
+                        return mint
             except (KeyError, TypeError, IndexError):
                 pass
             return None  # tx fetched fine but no matching instruction found
@@ -375,7 +398,7 @@ def send_telegram_alert(name, symbol, mint, market_cap_usd, volume_usd, image_ur
         return False
 
     # Skip if mcap has outrun volume - i.e. price is up on thin trading,
-    # not real activity.
+    # not real activity (classic rug/manipulated-curve signature).
     if volume_usd is not None and market_cap_usd > float(volume_usd):
         print(
             f"[PumpAlert] Skipping alert for {mint} - mcap ${market_cap_usd:,.0f} "

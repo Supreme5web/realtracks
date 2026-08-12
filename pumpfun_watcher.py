@@ -84,7 +84,7 @@ _dex_lock = threading.Lock()
 # first time it's touched after midnight UTC. This is the in-memory
 # fallback, used whenever Supabase isn't configured (see below) - it works
 # fine but resets on every restart/redeploy/idle spin-down.
-# mint -> {name, symbol, initial_mcap, hit_2x}
+# mint -> {name, symbol, initial_mcap, ath_mcap}
 daily_stats_lock = threading.Lock()
 daily_stats = {
     "date": datetime.now(STATS_DAY_TZ).date(),
@@ -105,14 +105,21 @@ daily_stats = {
 #     name text,
 #     symbol text,
 #     initial_mcap numeric,
-#     hit_2x boolean not null default false,
+#     ath_mcap numeric,
 #     called_at timestamptz not null default now(),
 #     primary key (call_date, mint)
 #   );
 #
+# If you already have this table from before (with a "hit_2x" column
+# instead), just add the new column - the old one can stay, it's simply no
+# longer written to:
+#
+#   alter table pumpfun_calls add column if not exists ath_mcap numeric;
+#
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 STATS_TABLE = os.environ.get("SUPABASE_STATS_TABLE", "pumpfun_calls")
+
 
 _supabase = None
 if SUPABASE_URL and SUPABASE_KEY:
@@ -355,6 +362,18 @@ def _crop_to_16_9(image_bytes):
         return None
 
 
+def _escape_md(s):
+    """Escapes Telegram legacy-Markdown special chars in untrusted text
+    (coin names/symbols come straight from token metadata, which isn't
+    controlled by us) so a stray "_", "*", "[", or "]" doesn't break
+    parsing and silently drop the whole message."""
+    if not s:
+        return s
+    for ch in ("_", "*", "[", "]"):
+        s = s.replace(ch, f"\\{ch}")
+    return s
+
+
 SOCIAL_BUTTON_LABELS = {
     "twitter": "\U0001F426 Twitter/X",
     "x": "\U0001F426 Twitter/X",
@@ -407,40 +426,40 @@ def send_telegram_alert(name, symbol, mint, market_cap_usd, volume_usd, image_ur
         return False
 
     lines = [
-        f"*{name}* [{symbol}]",
-        "",
-        f"\U0001F4B0 *Market Cap:* ${market_cap_usd:,.0f}",
+        f"\U0001F680 *{_escape_md(name)}* [{_escape_md(symbol)}]",
+        "\u2500" * 18,
+        f"\U0001F4B0 *Market Cap:*  ${market_cap_usd:,.0f}",
     ]
 
     # Always show volume from DexScreener
     if volume_usd is not None:
-        lines.append(f"\U0001F4CA *Volume:* ${float(volume_usd):,.0f}")
+        lines.append(f"\U0001F4CA *Volume:*  ${float(volume_usd):,.0f}")
 
-    # Socials/website as embedded (clickable) Markdown links rather than
-    # raw pasted URLs or buttons.
-    social_lines = []
+    # Socials/website as embedded (clickable) Markdown links, on one row
+    # separated by bullets rather than stacked lines - keeps the card short.
+    social_links = []
     for s_type, label in SOCIAL_BUTTON_LABELS.items():
         url = (socials or {}).get(s_type)
         if url:
-            social_lines.append(f"[{label}]({url})")
+            social_links.append(f"[{label}]({url})")
     if website:
-        social_lines.append(f"[\U0001F310 Website]({website})")
+        social_links.append(f"[\U0001F310 Website]({website})")
 
     # SOCIAL_BUTTON_LABELS has both "twitter" and "x" mapped to the same
     # label - dedupe so the same link doesn't show up twice.
     seen = set()
-    deduped_social_lines = []
-    for line in social_lines:
-        if line not in seen:
-            deduped_social_lines.append(line)
-            seen.add(line)
+    deduped_social_links = []
+    for link in social_links:
+        if link not in seen:
+            deduped_social_links.append(link)
+            seen.add(link)
 
-    if deduped_social_lines:
-        lines.append("")
-        lines.extend(deduped_social_lines)
+    if deduped_social_links:
+        lines.append("\u2500" * 18)
+        lines.append("   \u2022   ".join(deduped_social_links))
 
-    lines.append("")
-    lines.append(f"`{mint}`")
+    lines.append("\u2500" * 18)
+    lines.append(f"\U0001F4CB *Contract*\n`{mint}`")
 
     text = "\n".join(lines)
 
@@ -544,7 +563,7 @@ def _record_call(mint, name, symbol, mcap_usd):
                     "name": name,
                     "symbol": symbol,
                     "initial_mcap": mcap_usd,
-                    "hit_2x": False,
+                    "ath_mcap": mcap_usd,
                 }
             ).execute()
             return
@@ -558,7 +577,7 @@ def _record_call(mint, name, symbol, mcap_usd):
             "name": name,
             "symbol": symbol,
             "initial_mcap": mcap_usd,
-            "hit_2x": False,
+            "ath_mcap": mcap_usd,
         }
 
 
@@ -569,37 +588,63 @@ def _format_stats_message():
         try:
             resp = (
                 _supabase.table(STATS_TABLE)
-                .select("hit_2x")
+                .select("name,symbol,initial_mcap,ath_mcap")
                 .eq("call_date", today.isoformat())
                 .execute()
             )
             rows = resp.data or []
-            total = len(rows)
-            hits = sum(1 for r in rows if r.get("hit_2x"))
         except Exception as e:
             print(f"[PumpAlert] Supabase read failed for /stats: {e}", flush=True)
-            total, hits = 0, 0
+            rows = []
     else:
         with daily_stats_lock:
             _reset_if_new_day_unlocked()
-            total = len(daily_stats["called"])
-            hits = sum(1 for e in daily_stats["called"].values() if e["hit_2x"])
+            rows = list(daily_stats["called"].values())
 
-    date_label = f"{today.day}/{today.strftime('%b').upper()}/{today.year}"
+    total = len(rows)
+
+    # Multiple reached = all-time-high mcap / mcap at call time. Skip any
+    # row with no usable initial_mcap (shouldn't happen, but division safety).
+    multiples = []
+    for r in rows:
+        initial = r.get("initial_mcap")
+        ath = r.get("ath_mcap")
+        if initial and ath and initial > 0:
+            multiples.append((ath / initial, r))
+
+    hits = sum(1 for mult, _ in multiples if mult >= HITRATE_MULTIPLIER)
     hitrate = (hits / total * 100) if total else 0
 
-    return (
-        f"COINS CALLED {date_label}\n\n"
-        f"{total} COINS\n\n"
-        f"Hitrate: {hitrate:.0f}%"
-    )
+    date_label = f"{today.day}/{today.strftime('%b').upper()}/{today.year}"
+
+    lines = [
+        f"\U0001F4CA *COINS CALLED* \u2014 {date_label}",
+        "\u2500" * 18,
+        f"\U0001F3AF *Total Calls:*  {total}",
+        f"\u2705 *Hitrate (\u2265{HITRATE_MULTIPLIER:g}x):*  {hitrate:.0f}%",
+    ]
+
+    top5 = sorted(multiples, key=lambda pair: pair[0], reverse=True)[:5]
+    if top5:
+        lines.append("\u2500" * 18)
+        lines.append("\U0001F3C6 *Top 5 by ATH*")
+        medals = ["\U0001F947", "\U0001F948", "\U0001F949", "4\uFE0F\u20E3", "5\uFE0F\u20E3"]
+        for medal, (mult, r) in zip(medals, top5):
+            name = _escape_md(r.get("name") or "Unknown")
+            symbol = _escape_md(r.get("symbol") or "N/A")
+            lines.append(f"{medal} {name} [{symbol}] \u2014 *{mult:.1f}x*")
+
+    return "\n".join(lines)
 
 
 def _stats_tracking_loop():
     """Runs independently of the detection poll loop. Periodically re-checks
-    every not-yet-2x'd coin called today against DexScreener and marks it a
-    hit once its mcap reaches HITRATE_MULTIPLIER x its call-time mcap. Stops
-    caring about a coin once the day rolls over (00:00 UTC), per design."""
+    EVERY coin called today against DexScreener (not just ones that haven't
+    hit the hitrate multiplier yet - that was the old design) and ratchets
+    ath_mcap up whenever the current mcap exceeds it, so ath_mcap ends up
+    being the coin's true all-time-high for the day, used for both the
+    hitrate % and the top-5 list in /stats. Stops caring about a coin once
+    the day rolls over (00:00 UTC), per design."""
     while True:
         time.sleep(STATS_TRACK_INTERVAL_SECONDS)
         today = datetime.now(STATS_DAY_TZ).date()
@@ -608,44 +653,45 @@ def _stats_tracking_loop():
             try:
                 resp = (
                     _supabase.table(STATS_TABLE)
-                    .select("mint,initial_mcap")
+                    .select("mint,ath_mcap")
                     .eq("call_date", today.isoformat())
-                    .eq("hit_2x", False)
                     .execute()
                 )
-                pending_map = {r["mint"]: r["initial_mcap"] for r in (resp.data or [])}
+                ath_map = {r["mint"]: r["ath_mcap"] for r in (resp.data or [])}
             except Exception as e:
                 print(f"[PumpAlert] Supabase read failed in stats tracking loop: {e}", flush=True)
                 continue
         else:
             with daily_stats_lock:
                 _reset_if_new_day_unlocked()
-                pending_map = {
-                    mint: e["initial_mcap"]
-                    for mint, e in daily_stats["called"].items()
-                    if not e["hit_2x"]
+                ath_map = {
+                    mint: e["ath_mcap"] for mint, e in daily_stats["called"].items()
                 }
 
-        pending = list(pending_map.keys())
-        if not pending:
+        mints = list(ath_map.keys())
+        if not mints:
             continue
 
-        for i in range(0, len(pending), DEXSCREENER_BATCH_SIZE):
-            batch = pending[i:i + DEXSCREENER_BATCH_SIZE]
+        for i in range(0, len(mints), DEXSCREENER_BATCH_SIZE):
+            batch = mints[i:i + DEXSCREENER_BATCH_SIZE]
             results = fetch_market_caps(batch)
 
-            hit_mints = [
-                mint for mint in batch
-                if results.get(mint)
-                and results[mint]["mcap"] >= pending_map[mint] * HITRATE_MULTIPLIER
-            ]
-            if not hit_mints:
+            # Only coins whose current mcap is a new high for the day.
+            raised = {}
+            for mint in batch:
+                info = results.get(mint)
+                if not info:
+                    continue
+                current_ath = ath_map.get(mint) or 0
+                if info["mcap"] > current_ath:
+                    raised[mint] = info["mcap"]
+            if not raised:
                 continue
 
             if _supabase is not None:
-                for mint in hit_mints:
+                for mint, new_ath in raised.items():
                     try:
-                        _supabase.table(STATS_TABLE).update({"hit_2x": True}).eq(
+                        _supabase.table(STATS_TABLE).update({"ath_mcap": new_ath}).eq(
                             "call_date", today.isoformat()
                         ).eq("mint", mint).execute()
                     except Exception as e:
@@ -653,16 +699,10 @@ def _stats_tracking_loop():
             else:
                 with daily_stats_lock:
                     _reset_if_new_day_unlocked()
-                    for mint in hit_mints:
+                    for mint, new_ath in raised.items():
                         entry = daily_stats["called"].get(mint)
                         if entry:
-                            entry["hit_2x"] = True
-
-            for mint in hit_mints:
-                print(
-                    f"[PumpAlert] {mint} hit {HITRATE_MULTIPLIER}x call mcap",
-                    flush=True,
-                )
+                            entry["ath_mcap"] = new_ath
 
 
 def _commands_loop():
@@ -707,11 +747,21 @@ def _commands_loop():
             command = text.split()[0].split("@")[0].lower()
             if command == "/stats":
                 try:
-                    requests.post(
+                    resp = requests.post(
                         f"https://api.telegram.org/bot{token}/sendMessage",
-                        json={"chat_id": chat_id, "text": _format_stats_message()},
+                        json={
+                            "chat_id": chat_id,
+                            "text": _format_stats_message(),
+                            "parse_mode": "Markdown",
+                        },
                         timeout=10,
                     )
+                    if not resp.ok:
+                        print(
+                            f"[PumpAlert] /stats sendMessage failed for {chat_id} "
+                            f"({resp.status_code}): {resp.text[:300]}",
+                            flush=True,
+                        )
                 except Exception as e:
                     print(f"[PumpAlert] Failed to send /stats reply: {e}", flush=True)
 

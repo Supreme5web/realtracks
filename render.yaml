@@ -12,8 +12,9 @@ services:
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
-      # Set this and the RPC/WS URLs auto-build against Ankr. Leave unset
-      # to fall back to the public (rate-limited) Solana RPC instead.
+      # Optional - if set, RPC/WS URLs auto-build against Ankr's mainnet
+      # endpoint (requires a paid Ankr plan). Leave unset to use
+      # PublicNode's free mainnet RPC instead (no key needed, default).
       - key: ANKR_API_KEY
         sync: false
       - key: MIN_MARKET_CAP_USD

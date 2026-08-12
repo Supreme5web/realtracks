@@ -20,15 +20,24 @@ except ImportError:
 PUMP_FUN_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
 # Prefer Ankr if a key is provided - much higher rate limits and a far
-# more stable websocket than the public RPC. Falls back to public endpoints
-# (or explicit SOLANA_WS_URL/SOLANA_RPC_URL overrides) if no key is set.
+# more stable websocket than the public RPC. Falls back to PublicNode's
+# free mainnet endpoint (no key required) if no Ankr key is set.
+#
+# IMPORTANT: pump.fun only exists on Solana MAINNET. Make sure any RPC
+# endpoint you use is a mainnet one, NOT devnet/testnet - devnet will
+# connect fine and report "healthy" but will never see any real pump.fun
+# activity, since it doesn't exist there. Ankr's mainnet Solana endpoint
+# is locked behind a paid plan on the free tier, so PublicNode (free,
+# no key) is the default here instead. Set ANKR_API_KEY if/when you
+# upgrade, or set SOLANA_RPC_URL / SOLANA_WS_URL directly to point at
+# any other provider (Chainstack, Syndica, etc).
 ANKR_API_KEY = os.environ.get("ANKR_API_KEY", "")
 if ANKR_API_KEY:
     _default_ws = f"wss://rpc.ankr.com/solana/ws/{ANKR_API_KEY}"
     _default_rpc = f"https://rpc.ankr.com/solana/{ANKR_API_KEY}"
 else:
-    _default_ws = "wss://api.mainnet-beta.solana.com"
-    _default_rpc = "https://api.mainnet-beta.solana.com"
+    _default_ws = "wss://solana-rpc.publicnode.com"
+    _default_rpc = "https://solana-rpc.publicnode.com"
 
 SOLANA_WS_URL = os.environ.get("SOLANA_WS_URL", _default_ws)
 SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", _default_rpc)

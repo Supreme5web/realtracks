@@ -590,6 +590,48 @@ def _record_call(mint, name, symbol, mcap_usd):
         }
 
 
+def _format_recent_message():
+    """Shows the last 10 coins called (most recent first) with the multiple
+    each has hit so far (ath_mcap / initial_mcap), independent of the
+    /stats day boundary. With Supabase persistence this looks across all
+    days; the in-memory fallback can only see today's calls, since that
+    state resets at 00:00 UTC same as /stats."""
+    if _supabase is not None:
+        try:
+            resp = (
+                _supabase.table(STATS_TABLE)
+                .select("name,symbol,initial_mcap,ath_mcap,called_at")
+                .order("called_at", desc=True)
+                .limit(10)
+                .execute()
+            )
+            rows = resp.data or []
+        except Exception as e:
+            print(f"[PumpAlert] Supabase read failed for /recent: {e}", flush=True)
+            rows = []
+    else:
+        with daily_stats_lock:
+            _reset_if_new_day_unlocked()
+            rows = list(daily_stats["called"].values())[-10:][::-1]
+
+    if not rows:
+        return "\U0001F4CB *LAST 10 CALLS*\n" + "\u2500" * 18 + "\nNo calls yet."
+
+    lines = ["\U0001F4CB *LAST 10 CALLS*", "\u2500" * 18]
+    for i, r in enumerate(rows, start=1):
+        name = _escape_md(r.get("name") or "Unknown")
+        symbol = _escape_md(r.get("symbol") or "N/A")
+        initial = r.get("initial_mcap")
+        ath = r.get("ath_mcap")
+        if initial and ath and initial > 0:
+            mult_str = f"*{ath / initial:.1f}x*"
+        else:
+            mult_str = "N/A"
+        lines.append(f"{i}. {name} [{symbol}] \u2014 {mult_str}")
+
+    return "\n".join(lines)
+
+
 def _format_stats_message():
     today = datetime.now(STATS_DAY_TZ).date()
 
@@ -633,12 +675,17 @@ def _format_stats_message():
         f"\u2705 *Hitrate (\u2265{HITRATE_MULTIPLIER:g}x):*  {hitrate:.0f}%",
     ]
 
-    top5 = sorted(multiples, key=lambda pair: pair[0], reverse=True)[:5]
-    if top5:
+    top10 = sorted(multiples, key=lambda pair: pair[0], reverse=True)[:10]
+    if top10:
         lines.append("\u2500" * 18)
-        lines.append("\U0001F3C6 *Top 5 by ATH*")
-        medals = ["\U0001F947", "\U0001F948", "\U0001F949", "4\uFE0F\u20E3", "5\uFE0F\u20E3"]
-        for medal, (mult, r) in zip(medals, top5):
+        lines.append("\U0001F3C6 *Top 10 by ATH*")
+        medals = [
+            "\U0001F947", "\U0001F948", "\U0001F949",
+            "4\uFE0F\u20E3", "5\uFE0F\u20E3", "6\uFE0F\u20E3",
+            "7\uFE0F\u20E3", "8\uFE0F\u20E3", "9\uFE0F\u20E3",
+            "\U0001F51F",
+        ]
+        for medal, (mult, r) in zip(medals, top10):
             name = _escape_md(r.get("name") or "Unknown")
             symbol = _escape_md(r.get("symbol") or "N/A")
             lines.append(f"{medal} {name} [{symbol}] \u2014 *{mult:.1f}x*")
@@ -652,7 +699,7 @@ def _stats_tracking_loop():
     hit the hitrate multiplier yet - that was the old design) and ratchets
     ath_mcap up whenever the current mcap exceeds it, so ath_mcap ends up
     being the coin's true all-time-high for the day, used for both the
-    hitrate % and the top-5 list in /stats. Stops caring about a coin once
+    hitrate % and the top-10 list in /stats. Stops caring about a coin once
     the day rolls over (00:00 UTC), per design."""
     while True:
         time.sleep(STATS_TRACK_INTERVAL_SECONDS)
@@ -715,9 +762,9 @@ def _stats_tracking_loop():
 
 
 def _commands_loop():
-    """Long-polls Telegram getUpdates for incoming commands (currently just
-    /stats) and replies in the chat it was sent from. Only responds to chats
-    listed in TELEGRAM_CHAT_ID, so randoms can't probe a public bot."""
+    """Long-polls Telegram getUpdates for incoming commands (/stats and
+    /recent) and replies in the chat it was sent from. Only responds to
+    chats listed in TELEGRAM_CHAT_ID, so randoms can't probe a public bot."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     allowed_chat_ids = {
         c.strip() for c in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if c.strip()
@@ -754,25 +801,26 @@ def _commands_loop():
                 continue
 
             command = text.split()[0].split("@")[0].lower()
-            if command == "/stats":
+            if command in ("/stats", "/recent"):
+                reply_text = _format_stats_message() if command == "/stats" else _format_recent_message()
                 try:
                     resp = requests.post(
                         f"https://api.telegram.org/bot{token}/sendMessage",
                         json={
                             "chat_id": chat_id,
-                            "text": _format_stats_message(),
+                            "text": reply_text,
                             "parse_mode": "Markdown",
                         },
                         timeout=10,
                     )
                     if not resp.ok:
                         print(
-                            f"[PumpAlert] /stats sendMessage failed for {chat_id} "
+                            f"[PumpAlert] {command} sendMessage failed for {chat_id} "
                             f"({resp.status_code}): {resp.text[:300]}",
                             flush=True,
                         )
                 except Exception as e:
-                    print(f"[PumpAlert] Failed to send /stats reply: {e}", flush=True)
+                    print(f"[PumpAlert] Failed to send {command} reply: {e}", flush=True)
 
 
 # ---------------------------------------------------------------------------

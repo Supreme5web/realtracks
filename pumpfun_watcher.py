@@ -19,13 +19,13 @@ except ImportError:
 # ---------------------------------------------------------------------------
 PUMP_FUN_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
-# Prefer Helius if a key is provided - much higher rate limits and a far
+# Prefer Ankr if a key is provided - much higher rate limits and a far
 # more stable websocket than the public RPC. Falls back to public endpoints
 # (or explicit SOLANA_WS_URL/SOLANA_RPC_URL overrides) if no key is set.
-HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY", "")
-if HELIUS_API_KEY:
-    _default_ws = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
-    _default_rpc = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+ANKR_API_KEY = os.environ.get("ANKR_API_KEY", "")
+if ANKR_API_KEY:
+    _default_ws = f"wss://rpc.ankr.com/solana/ws/{ANKR_API_KEY}"
+    _default_rpc = f"https://rpc.ankr.com/solana/{ANKR_API_KEY}"
 else:
     _default_ws = "wss://api.mainnet-beta.solana.com"
     _default_rpc = "https://api.mainnet-beta.solana.com"

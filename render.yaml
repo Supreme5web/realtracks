@@ -12,9 +12,9 @@ services:
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
-      # Set this and the RPC/WS URLs auto-build against Helius. Leave unset
+      # Set this and the RPC/WS URLs auto-build against Ankr. Leave unset
       # to fall back to the public (rate-limited) Solana RPC instead.
-      - key: HELIUS_API_KEY
+      - key: ANKR_API_KEY
         sync: false
       - key: MIN_MARKET_CAP_USD
         value: "12000"

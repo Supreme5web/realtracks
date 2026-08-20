@@ -34,3 +34,12 @@ services:
         sync: false
       - key: SUPABASE_KEY
         sync: false
+      # Optional - lets you type /ask <question> (or just a plain-text
+      # question) into the Telegram chat and get an answer grounded in
+      # this bot's own call-history stats, via Gemini 3.5 Flash-Lite.
+      # Get a free key at aistudio.google.com. Leave unset and /ask just
+      # replies that it's not configured - everything else still works.
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: "gemini-3.5-flash-lite"

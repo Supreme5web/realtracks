@@ -2,6 +2,7 @@ import os
 import json
 import time
 import asyncio
+import statistics
 import threading
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
@@ -69,6 +70,21 @@ STATS_DAY_TZ = timezone.utc  # the day boundary for /stats resets at 00:00 UTC
 STATS_TIMEFRAME_OPTIONS_HOURS = [1, 4, 6, 12, 24]
 STATS_DEFAULT_TIMEFRAME_HOURS = 24
 
+# Multiples of the call-time market cap we track "time to X" for, so /stats
+# and /ask can tell you not just THAT a coin ran, but how fast it typically
+# does, so you know how long to actually wait around for an entry/exit.
+MILESTONE_MULTIPLIERS = [1.5, 2.0, 3.0, 5.0, 10.0]
+
+# --- AI insights (/ask) config ------------------------------------------
+# Optional - lets you ask a plain-English question about this bot's own
+# call history (e.g. "what volume should I look for before buying?") and
+# get an answer grounded in the /stats data above, via Gemini 3.5
+# Flash-Lite. Leave GEMINI_API_KEY unset and /ask just tells you it's not
+# configured; everything else in the bot works the same either way.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
 # Log line Anchor emits for the pump.fun "create" instruction. logsSubscribe
 # is already filtered to txs that mention the program, so this line is what
 # actually distinguishes "new mint" from every buy/sell/other tx on it.
@@ -121,15 +137,25 @@ daily_stats = {
 #     symbol text,
 #     initial_mcap numeric,
 #     ath_mcap numeric,
+#     initial_volume numeric,
+#     ath_volume numeric,
+#     ath_reached_at timestamptz,
+#     call_hour_utc int,
+#     milestones jsonb not null default '{}'::jsonb,
 #     called_at timestamptz not null default now(),
 #     primary key (call_date, mint)
 #   );
 #
-# If you already have this table from before (with a "hit_2x" column
-# instead), just add the new column - the old one can stay, it's simply no
-# longer written to:
+# If you already have this table from before, just add whichever of these
+# columns are missing - old ones can stay, they're simply no longer (or
+# still) written to:
 #
 #   alter table pumpfun_calls add column if not exists ath_mcap numeric;
+#   alter table pumpfun_calls add column if not exists initial_volume numeric;
+#   alter table pumpfun_calls add column if not exists ath_volume numeric;
+#   alter table pumpfun_calls add column if not exists ath_reached_at timestamptz;
+#   alter table pumpfun_calls add column if not exists call_hour_utc int;
+#   alter table pumpfun_calls add column if not exists milestones jsonb not null default '{}'::jsonb;
 #
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
@@ -564,10 +590,14 @@ def _reset_if_new_day_unlocked():
         daily_stats["called"] = {}
 
 
-def _record_call(mint, name, symbol, mcap_usd):
+def _record_call(mint, name, symbol, mcap_usd, volume_usd=None):
     """Logs a coin as "called" for today's /stats count, right after an
-    alert is actually sent (not just queued/considered)."""
+    alert is actually sent (not just queued/considered). Seeds the row with
+    initial mcap/volume and the UTC hour of the call, so the tracking loop
+    below can later fill in ath_mcap/ath_volume and time-to-milestone."""
     today = datetime.now(STATS_DAY_TZ).date()
+    now = datetime.now(timezone.utc)
+    hour_utc = now.hour
 
     if _supabase is not None:
         try:
@@ -579,6 +609,10 @@ def _record_call(mint, name, symbol, mcap_usd):
                     "symbol": symbol,
                     "initial_mcap": mcap_usd,
                     "ath_mcap": mcap_usd,
+                    "initial_volume": volume_usd,
+                    "ath_volume": volume_usd,
+                    "call_hour_utc": hour_utc,
+                    "milestones": {},
                 }
             ).execute()
             return
@@ -593,6 +627,10 @@ def _record_call(mint, name, symbol, mcap_usd):
             "symbol": symbol,
             "initial_mcap": mcap_usd,
             "ath_mcap": mcap_usd,
+            "initial_volume": volume_usd,
+            "ath_volume": volume_usd,
+            "call_hour_utc": hour_utc,
+            "milestones": {},
             "called_at": time.time(),
         }
 
@@ -661,38 +699,46 @@ def _build_stats_keyboard(selected_hours):
     return {"inline_keyboard": [row]}
 
 
-def _format_stats_message(hours=STATS_DEFAULT_TIMEFRAME_HOURS):
-    """Builds the /stats text for a rolling `hours`-wide window (1/4/6/12/24h,
-    selected via the inline keyboard). Total calls, hitrate, and the top-10
-    list are all scoped to that window."""
+def _gather_rows(hours):
+    """Fetches all the fields needed for /stats and /ask, scoped to a
+    rolling `hours`-wide window."""
     cutoff_dt = datetime.now(timezone.utc) - timedelta(hours=hours)
 
     if _supabase is not None:
         try:
             resp = (
                 _supabase.table(STATS_TABLE)
-                .select("name,symbol,initial_mcap,ath_mcap,called_at")
+                .select(
+                    "name,symbol,initial_mcap,ath_mcap,initial_volume,ath_volume,"
+                    "call_hour_utc,milestones,called_at"
+                )
                 .gte("called_at", cutoff_dt.isoformat())
                 .execute()
             )
-            rows = resp.data or []
+            return resp.data or []
         except Exception as e:
-            print(f"[PumpAlert] Supabase read failed for /stats: {e}", flush=True)
-            rows = []
-    else:
-        # In-memory fallback only ever holds "today" (it's cleared at
-        # 00:00 UTC - see _reset_if_new_day_unlocked), so a window request
-        # that reaches back across the day boundary just won't see calls
-        # from before the reset. Acceptable trade-off for the no-Supabase
-        # fallback; Supabase mode above isn't affected by this.
-        cutoff_ts = time.time() - hours * 3600
-        with daily_stats_lock:
-            _reset_if_new_day_unlocked()
-            rows = [
-                r for r in daily_stats["called"].values()
-                if (r.get("called_at") or 0) >= cutoff_ts
-            ]
+            print(f"[PumpAlert] Supabase read failed: {e}", flush=True)
+            return []
 
+    # In-memory fallback only ever holds "today" (it's cleared at 00:00 UTC
+    # - see _reset_if_new_day_unlocked), so a window request that reaches
+    # back across the day boundary just won't see calls from before the
+    # reset. Acceptable trade-off for the no-Supabase fallback; Supabase
+    # mode above isn't affected by this.
+    cutoff_ts = time.time() - hours * 3600
+    with daily_stats_lock:
+        _reset_if_new_day_unlocked()
+        return [
+            r for r in daily_stats["called"].values()
+            if (r.get("called_at") or 0) >= cutoff_ts
+        ]
+
+
+def _format_stats_message(hours=STATS_DEFAULT_TIMEFRAME_HOURS):
+    """Builds the /stats text for a rolling `hours`-wide window (1/4/6/12/24h,
+    selected via the inline keyboard). Total calls, hitrate, milestone
+    hit-rates/timing, and the top-10 list are all scoped to that window."""
+    rows = _gather_rows(hours)
     total = len(rows)
 
     # Multiple reached = all-time-high mcap / mcap at call time. Skip any
@@ -716,6 +762,14 @@ def _format_stats_message(hours=STATS_DEFAULT_TIMEFRAME_HOURS):
         f"\u2705 *Hitrate (\u2265{HITRATE_MULTIPLIER:g}x):*  {hitrate:.0f}%",
     ]
 
+    milestone_line = _format_milestone_line(rows, total)
+    if milestone_line:
+        lines.append(milestone_line)
+
+    best_hour_line = _format_best_hour_line(rows)
+    if best_hour_line:
+        lines.append(best_hour_line)
+
     top10 = sorted(multiples, key=lambda pair: pair[0], reverse=True)[:10]
     if top10:
         lines.append("\u2500" * 18)
@@ -728,14 +782,218 @@ def _format_stats_message(hours=STATS_DEFAULT_TIMEFRAME_HOURS):
     return "\n".join(lines)
 
 
+def _format_milestone_line(rows, total):
+    """One compact line summarizing how many calls hit 2x and 5x, and the
+    median time it took - the two numbers most useful for deciding how
+    long to actually wait around after a call before giving up on it."""
+    if not total:
+        return None
+    times_2x, times_5x = [], []
+    hits_2x = hits_5x = 0
+    for r in rows:
+        milestones = r.get("milestones") or {}
+        if "2.0" in milestones:
+            hits_2x += 1
+            times_2x.append(milestones["2.0"])
+        if "5.0" in milestones:
+            hits_5x += 1
+            times_5x.append(milestones["5.0"])
+    if not times_2x and not times_5x:
+        return None
+    parts = []
+    if times_2x:
+        parts.append(
+            f"2x: {hits_2x}/{total} ({hits_2x/total*100:.0f}%), median {_format_duration(statistics.median(times_2x))}"
+        )
+    if times_5x:
+        parts.append(
+            f"5x: {hits_5x}/{total} ({hits_5x/total*100:.0f}%), median {_format_duration(statistics.median(times_5x))}"
+        )
+    return f"\u23F1 *Speed to hit:*  " + "  \u2022  ".join(parts)
+
+
+def _format_best_hour_line(rows, min_samples=3):
+    """One line naming the UTC hour with the best 2x hit rate, so you know
+    when this bot's calls have historically performed best. Requires at
+    least `min_samples` calls in an hour to avoid a single lucky/unlucky
+    call skewing the result."""
+    buckets = {}
+    for r in rows:
+        hour = r.get("call_hour_utc")
+        if hour is None:
+            continue
+        milestones = r.get("milestones") or {}
+        b = buckets.setdefault(hour, {"total": 0, "hits": 0})
+        b["total"] += 1
+        if "2.0" in milestones:
+            b["hits"] += 1
+    qualifying = {h: v for h, v in buckets.items() if v["total"] >= min_samples}
+    if not qualifying:
+        return None
+    best_hour, v = max(qualifying.items(), key=lambda kv: kv[1]["hits"] / kv[1]["total"])
+    rate = v["hits"] / v["total"] * 100
+    return f"\U0001F550 *Best hour (UTC):*  {best_hour:02d}:00\u2013{best_hour:02d}:59 \u2014 {v['hits']}/{v['total']} ({rate:.0f}%) hit 2x"
+
+
+def _format_duration(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m"
+
+
+def get_insights_digest(hours=STATS_DEFAULT_TIMEFRAME_HOURS):
+    """Builds a plain-text analytical digest (not Markdown-formatted, no
+    emoji) of call performance over the given window - this is what gets
+    handed to Gemini as grounding context for /ask, and is also usable
+    standalone if you want the raw numbers. Covers: volume of coins that
+    ran vs didn't, hit rates + timing per multiplier, and best call hour."""
+    rows = _gather_rows(hours)
+    total = len(rows)
+    if not total:
+        return f"No calls in the last {hours}h - nothing to analyze yet."
+
+    lines = [f"Window: last {hours}h. Total calls: {total}."]
+
+    for m in MILESTONE_MULTIPLIERS:
+        key = str(m)
+        times = [r["milestones"][key] for r in rows if key in (r.get("milestones") or {})]
+        hits = len(times)
+        rate = hits / total * 100
+        if times:
+            lines.append(
+                f"- Reached {m}x: {hits}/{total} ({rate:.0f}%). "
+                f"Median time: {_format_duration(statistics.median(times))}, "
+                f"avg: {_format_duration(statistics.mean(times))}."
+            )
+        else:
+            lines.append(f"- Reached {m}x: {hits}/{total} ({rate:.0f}%).")
+
+    winners_vol, losers_vol = [], []
+    for r in rows:
+        vol = r.get("initial_volume")
+        if vol is None:
+            continue
+        if "2.0" in (r.get("milestones") or {}):
+            winners_vol.append(vol)
+        else:
+            losers_vol.append(vol)
+    if winners_vol and losers_vol:
+        lines.append(
+            f"- Avg volume at call time: ${statistics.mean(winners_vol):,.0f} for coins that reached 2x, "
+            f"vs ${statistics.mean(losers_vol):,.0f} for coins that didn't (yet)."
+        )
+
+    hour_buckets = {}
+    for r in rows:
+        hour = r.get("call_hour_utc")
+        if hour is None:
+            continue
+        b = hour_buckets.setdefault(hour, {"total": 0, "hits": 0})
+        b["total"] += 1
+        if "2.0" in (r.get("milestones") or {}):
+            b["hits"] += 1
+    qualifying = {h: v for h, v in hour_buckets.items() if v["total"] >= 3}
+    if qualifying:
+        best_hour, v = max(qualifying.items(), key=lambda kv: kv[1]["hits"] / kv[1]["total"])
+        lines.append(
+            f"- Best call hour (UTC, min 3 samples): {best_hour:02d}:00-{best_hour:02d}:59, "
+            f"{v['hits']}/{v['total']} ({v['hits']/v['total']*100:.0f}%) reached 2x."
+        )
+
+    ranked = []
+    for r in rows:
+        initial, ath = r.get("initial_mcap"), r.get("ath_mcap")
+        if initial and ath and initial > 0:
+            ranked.append((ath / initial, r))
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    if ranked:
+        lines.append("Top runners (peak vs call market cap):")
+        for ratio, r in ranked[:5]:
+            lines.append(
+                f"  * {r.get('name') or 'Unknown'} ({r.get('symbol') or 'N/A'}): {ratio:.1f}x "
+                f"- call MC ${r.get('initial_mcap', 0):,.0f} -> peak MC ${r.get('ath_mcap', 0):,.0f}"
+            )
+
+    return "\n".join(lines)
+
+
+_GEMINI_SYSTEM_PREAMBLE = (
+    "You are a trading data analyst for a Solana pump.fun call/alert bot. "
+    "You'll be given a plain-text digest of how this specific bot's past "
+    "calls actually performed (hit rates per multiple, time-to-multiple, "
+    "volume patterns, best call hour, top runners). Answer the user's "
+    "question using ONLY that data. Be concise and concrete - cite real "
+    "numbers from the digest instead of generic trading advice. If the "
+    "digest doesn't have enough samples to answer confidently, say so "
+    "plainly instead of guessing. Don't pad every answer with a financial "
+    "disclaimer - only mention it if directly relevant."
+)
+
+
+def ask_gemini(question, hours=STATS_DEFAULT_TIMEFRAME_HOURS):
+    """Sends the current insights digest + the user's question to Gemini
+    3.5 Flash-Lite and returns its answer as a string. Never raises -
+    returns a plain-text error message on any failure."""
+    if not GEMINI_API_KEY:
+        return "GEMINI_API_KEY isn't set, so I can't ask the AI anything yet - add it in Render's env vars."
+
+    digest = get_insights_digest(hours)
+    prompt = f"{_GEMINI_SYSTEM_PREAMBLE}\n\n--- CALL HISTORY DIGEST ---\n{digest}\n\n--- QUESTION ---\n{question}"
+
+    try:
+        resp = requests.post(
+            GEMINI_URL,
+            params={"key": GEMINI_API_KEY},
+            json={
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generationConfig": {"maxOutputTokens": 700},
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        candidates = data.get("candidates") or []
+        if not candidates:
+            return "Gemini didn't return an answer - it may have blocked the response. Try rephrasing."
+        parts = candidates[0].get("content", {}).get("parts", [])
+        text = "".join(p.get("text", "") for p in parts).strip()
+        return text or "Gemini returned an empty response - try rephrasing the question."
+    except Exception as e:
+        print(f"[PumpAlert] Gemini request failed: {e}", flush=True)
+        return f"Couldn't reach Gemini right now ({e}). Try again in a bit."
+
+
+def _parse_called_at(value):
+    """called_at comes back as a float epoch (in-memory) or an ISO8601
+    string (Supabase). Normalizes either to an epoch float."""
+    if isinstance(value, (int, float)):
+        return value
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return time.time()
+
+
 def _stats_tracking_loop():
     """Runs independently of the detection poll loop. Periodically re-checks
     EVERY coin called today against DexScreener (not just ones that haven't
-    hit the hitrate multiplier yet - that was the old design) and ratchets
-    ath_mcap up whenever the current mcap exceeds it, so ath_mcap ends up
-    being the coin's true all-time-high for the day, used for both the
-    hitrate % and the top-10 list in /stats. Stops caring about a coin once
-    the day rolls over (00:00 UTC), per design."""
+    hit the hitrate multiplier yet - that was the old design). For each
+    coin it:
+      - ratchets ath_mcap/ath_volume up whenever the current mcap exceeds
+        the stored ath, recording ath_reached_at too, so ath_mcap ends up
+        being the coin's true all-time-high for the day (used by the
+        hitrate % and top-10 list in /stats), and ath_volume tells you how
+        much volume was actually flowing at that peak.
+      - fills in milestones (time-to-1.5x/2x/3x/5x/10x the call mcap) the
+        first time each multiple is crossed, so /stats and /ask can tell
+        you how long a typical run actually takes.
+    Stops caring about a coin once the day rolls over (00:00 UTC), per
+    design."""
     while True:
         time.sleep(STATS_TRACK_INTERVAL_SECONDS)
         today = datetime.now(STATS_DAY_TZ).date()
@@ -744,22 +1002,22 @@ def _stats_tracking_loop():
             try:
                 resp = (
                     _supabase.table(STATS_TABLE)
-                    .select("mint,ath_mcap")
+                    .select("mint,initial_mcap,ath_mcap,ath_volume,called_at,milestones")
                     .eq("call_date", today.isoformat())
                     .execute()
                 )
-                ath_map = {r["mint"]: r["ath_mcap"] for r in (resp.data or [])}
+                row_map = {r["mint"]: r for r in (resp.data or [])}
             except Exception as e:
                 print(f"[PumpAlert] Supabase read failed in stats tracking loop: {e}", flush=True)
                 continue
         else:
             with daily_stats_lock:
                 _reset_if_new_day_unlocked()
-                ath_map = {
-                    mint: e["ath_mcap"] for mint, e in daily_stats["called"].items()
+                row_map = {
+                    mint: dict(e) for mint, e in daily_stats["called"].items()
                 }
 
-        mints = list(ath_map.keys())
+        mints = list(row_map.keys())
         if not mints:
             continue
 
@@ -767,22 +1025,46 @@ def _stats_tracking_loop():
             batch = mints[i:i + DEXSCREENER_BATCH_SIZE]
             results = fetch_market_caps(batch)
 
-            # Only coins whose current mcap is a new high for the day.
-            raised = {}
+            updates = {}  # mint -> dict of fields to persist
             for mint in batch:
                 info = results.get(mint)
                 if not info:
                     continue
-                current_ath = ath_map.get(mint) or 0
-                if info["mcap"] > current_ath:
-                    raised[mint] = info["mcap"]
-            if not raised:
+                row = row_map.get(mint) or {}
+                current_ath = row.get("ath_mcap") or 0
+                current_mcap = info["mcap"]
+                current_volume = info.get("volume_usd")
+
+                fields = {}
+                if current_mcap > current_ath:
+                    fields["ath_mcap"] = current_mcap
+                    fields["ath_volume"] = current_volume
+                    fields["ath_reached_at"] = datetime.now(timezone.utc).isoformat()
+
+                initial_mcap = row.get("initial_mcap") or 0
+                if initial_mcap > 0:
+                    milestones = dict(row.get("milestones") or {})
+                    called_at = _parse_called_at(row.get("called_at"))
+                    ratio = current_mcap / initial_mcap
+                    new_milestone = False
+                    for m in MILESTONE_MULTIPLIERS:
+                        key = str(m)
+                        if ratio >= m and key not in milestones:
+                            milestones[key] = round(time.time() - called_at, 1)
+                            new_milestone = True
+                    if new_milestone:
+                        fields["milestones"] = milestones
+
+                if fields:
+                    updates[mint] = fields
+
+            if not updates:
                 continue
 
             if _supabase is not None:
-                for mint, new_ath in raised.items():
+                for mint, fields in updates.items():
                     try:
-                        _supabase.table(STATS_TABLE).update({"ath_mcap": new_ath}).eq(
+                        _supabase.table(STATS_TABLE).update(fields).eq(
                             "call_date", today.isoformat()
                         ).eq("mint", mint).execute()
                     except Exception as e:
@@ -790,10 +1072,10 @@ def _stats_tracking_loop():
             else:
                 with daily_stats_lock:
                     _reset_if_new_day_unlocked()
-                    for mint, new_ath in raised.items():
+                    for mint, fields in updates.items():
                         entry = daily_stats["called"].get(mint)
                         if entry:
-                            entry["ath_mcap"] = new_ath
+                            entry.update(fields)
 
 
 def _commands_loop():
@@ -884,6 +1166,36 @@ def _commands_loop():
                         )
                 except Exception as e:
                     print(f"[PumpAlert] Failed to send /recent reply: {e}", flush=True)
+            elif command == "/ask":
+                question = text[len(command):].strip()
+                if not question:
+                    _send_plain_message(token, chat_id, "Usage: /ask <your question> - e.g. /ask what volume should I look for?")
+                else:
+                    _send_plain_message(token, chat_id, ask_gemini(question))
+            elif not command.startswith("/"):
+                # Not a recognized slash-command - treat any plain-text
+                # message as a question for the AI, so you can just type
+                # naturally instead of remembering the /ask prefix.
+                _send_plain_message(token, chat_id, ask_gemini(text))
+
+
+def _send_plain_message(token, chat_id, text):
+    """Small helper for the AI-reply paths (/ask + free-text questions) -
+    plain text, no Markdown, since Gemini's output isn't Telegram-escaped
+    and could contain characters that break Markdown parsing."""
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
+            timeout=15,
+        )
+        if not resp.ok:
+            print(
+                f"[PumpAlert] sendMessage failed for {chat_id} ({resp.status_code}): {resp.text[:300]}",
+                flush=True,
+            )
+    except Exception as e:
+        print(f"[PumpAlert] Failed to send message to {chat_id}: {e}", flush=True)
 
 
 def _handle_stats_callback(token, callback_query, allowed_chat_ids):
@@ -1144,7 +1456,7 @@ def _poll_loop():
                     # (volume/socials filters) even after the mcap gate.
                     if sent:
                         watcher_status["alerts_sent"] += 1
-                        _record_call(mint, info["name"], info["symbol"], info["mcap"])
+                        _record_call(mint, info["name"], info["symbol"], info["mcap"], info.get("volume_usd"))
 
         # Sweep stale/alerted entries out of the tracked dict.
         with tracked_lock:

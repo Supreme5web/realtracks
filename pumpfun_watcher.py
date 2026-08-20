@@ -923,34 +923,75 @@ def get_insights_digest(hours=STATS_DEFAULT_TIMEFRAME_HOURS):
 
 
 _GEMINI_SYSTEM_PREAMBLE = (
-    "You are a trading data analyst for a Solana pump.fun call/alert bot. "
-    "You'll be given a plain-text digest of how this specific bot's past "
-    "calls actually performed (hit rates per multiple, time-to-multiple, "
-    "volume patterns, best call hour, top runners). Answer the user's "
-    "question using ONLY that data. Be concise and concrete - cite real "
-    "numbers from the digest instead of generic trading advice. If the "
-    "digest doesn't have enough samples to answer confidently, say so "
+    "You are a trading data analyst for a Solana pump.fun call/alert bot, "
+    "chatting with the person who runs the bot. You'll be given a "
+    "plain-text digest of how this specific bot's past calls actually "
+    "performed (hit rates per multiple, time-to-multiple, volume "
+    "patterns, best call hour, top runners) at the start of this "
+    "conversation, and it may be refreshed on later turns if it's changed. "
+    "Answer questions using ONLY that data. Be concise and concrete - cite "
+    "real numbers from the digest instead of generic trading advice. If "
+    "the digest doesn't have enough samples to answer confidently, say so "
     "plainly instead of guessing. Don't pad every answer with a financial "
-    "disclaimer - only mention it if directly relevant."
+    "disclaimer - only mention it if directly relevant. This is an "
+    "ongoing back-and-forth conversation, so remember what's already been "
+    "asked and answered and refer back to it naturally instead of "
+    "repeating yourself. Replies are sent as plain text in Telegram, not "
+    "rendered Markdown, so never use asterisks, underscores, backticks, or "
+    "any other Markdown/formatting syntax - write plain sentences and, if "
+    "needed, a simple hyphen-bulleted list."
 )
 
+# How many past turns (user + model messages combined) to keep per chat,
+# so the AI remembers earlier questions in the conversation instead of
+# answering each message in isolation. Trimmed from the oldest end.
+CHAT_HISTORY_MAX_TURNS = int(os.environ.get("CHAT_HISTORY_MAX_TURNS", "20"))
 
-def ask_gemini(question, hours=STATS_DEFAULT_TIMEFRAME_HOURS):
-    """Sends the current insights digest + the user's question to Gemini
-    3.5 Flash-Lite and returns its answer as a string. Never raises -
-    returns a plain-text error message on any failure."""
+_chat_history_lock = threading.Lock()
+_chat_history = {}  # chat_id -> list of {"role": "user"|"model", "parts": [{"text": ...}]}
+
+
+def _strip_markdown(text):
+    """Defensive cleanup in case Gemini still slips in Markdown syntax
+    despite the prompt instruction - since this text goes out with no
+    parse_mode, unstripped '**'/'_'/'`' would otherwise show up literally
+    in the Telegram message instead of being rendered."""
+    for token in ("**", "__", "```", "`"):
+        text = text.replace(token, "")
+    return text
+
+
+def reset_chat(chat_id):
+    """Clears conversation memory for a chat (used by /reset)."""
+    with _chat_history_lock:
+        _chat_history.pop(str(chat_id), None)
+
+
+def ask_gemini(question, chat_id, hours=STATS_DEFAULT_TIMEFRAME_HOURS):
+    """Sends the running conversation for this chat (plus the latest stats
+    digest as a system instruction) to Gemini 3.5 Flash-Lite, so talking to
+    the bot feels like an ongoing chat rather than one-shot Q&A - it
+    remembers what you already asked. Never raises - returns a plain-text
+    error message on any failure."""
     if not GEMINI_API_KEY:
         return "GEMINI_API_KEY isn't set, so I can't ask the AI anything yet - add it in Render's env vars."
 
+    chat_id = str(chat_id)
     digest = get_insights_digest(hours)
-    prompt = f"{_GEMINI_SYSTEM_PREAMBLE}\n\n--- CALL HISTORY DIGEST ---\n{digest}\n\n--- QUESTION ---\n{question}"
+    system_text = f"{_GEMINI_SYSTEM_PREAMBLE}\n\n--- CALL HISTORY DIGEST ---\n{digest}"
+
+    with _chat_history_lock:
+        history = list(_chat_history.get(chat_id, []))
+
+    contents = history + [{"role": "user", "parts": [{"text": question}]}]
 
     try:
         resp = requests.post(
             GEMINI_URL,
             params={"key": GEMINI_API_KEY},
             json={
-                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "system_instruction": {"parts": [{"text": system_text}]},
+                "contents": contents,
                 "generationConfig": {"maxOutputTokens": 700},
             },
             timeout=30,
@@ -962,7 +1003,18 @@ def ask_gemini(question, hours=STATS_DEFAULT_TIMEFRAME_HOURS):
             return "Gemini didn't return an answer - it may have blocked the response. Try rephrasing."
         parts = candidates[0].get("content", {}).get("parts", [])
         text = "".join(p.get("text", "") for p in parts).strip()
-        return text or "Gemini returned an empty response - try rephrasing the question."
+        text = _strip_markdown(text)
+        if not text:
+            return "Gemini returned an empty response - try rephrasing the question."
+
+        with _chat_history_lock:
+            updated = history + [
+                {"role": "user", "parts": [{"text": question}]},
+                {"role": "model", "parts": [{"text": text}]},
+            ]
+            _chat_history[chat_id] = updated[-CHAT_HISTORY_MAX_TURNS:]
+
+        return text
     except Exception as e:
         print(f"[PumpAlert] Gemini request failed: {e}", flush=True)
         return f"Couldn't reach Gemini right now ({e}). Try again in a bit."
@@ -1079,10 +1131,14 @@ def _stats_tracking_loop():
 
 
 def _commands_loop():
-    """Long-polls Telegram getUpdates for incoming commands (/stats and
-    /recent) plus the /stats timeframe-button taps (callback queries), and
-    replies in the chat it was sent from. Only responds to chats listed in
-    TELEGRAM_CHAT_ID, so randoms can't probe a public bot."""
+    """Long-polls Telegram getUpdates for incoming commands (/stats,
+    /recent, /reset) plus the /stats timeframe-button taps (callback
+    queries), and replies in the chat it was sent from. Any plain-text
+    message that isn't a recognized command is treated as a chat message
+    to the AI - no /ask prefix needed, and it remembers earlier turns in
+    the same chat (use /reset to clear that memory). Only responds to
+    chats listed in TELEGRAM_CHAT_ID, so randoms can't probe a public
+    bot."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     allowed_chat_ids = {
         c.strip() for c in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if c.strip()
@@ -1167,16 +1223,21 @@ def _commands_loop():
                 except Exception as e:
                     print(f"[PumpAlert] Failed to send /recent reply: {e}", flush=True)
             elif command == "/ask":
+                # Kept as an optional alias, but no longer required - see
+                # the plain-text branch below.
                 question = text[len(command):].strip()
                 if not question:
-                    _send_plain_message(token, chat_id, "Usage: /ask <your question> - e.g. /ask what volume should I look for?")
+                    _send_plain_message(token, chat_id, "Just type your question normally - no /ask needed. What do you want to know?")
                 else:
-                    _send_plain_message(token, chat_id, ask_gemini(question))
+                    _send_plain_message(token, chat_id, ask_gemini(question, chat_id))
+            elif command == "/reset":
+                reset_chat(chat_id)
+                _send_plain_message(token, chat_id, "Cleared - starting fresh. What do you want to know?")
             elif not command.startswith("/"):
-                # Not a recognized slash-command - treat any plain-text
-                # message as a question for the AI, so you can just type
-                # naturally instead of remembering the /ask prefix.
-                _send_plain_message(token, chat_id, ask_gemini(text))
+                # Not a recognized slash-command - just chat. Every plain
+                # message goes straight to the AI with no prefix needed,
+                # and it remembers earlier turns in this chat.
+                _send_plain_message(token, chat_id, ask_gemini(text, chat_id))
 
 
 def _send_plain_message(token, chat_id, text):
